@@ -1611,8 +1611,12 @@ elif menu == "⑤ 모델 성능 평가":
 
     st.markdown("#### ④ 데이터 수와 클래스 불균형의 영향")
 
-    largest_class = class_counts_clean.idxmax()
-    smallest_class = class_counts_clean.idxmin()
+   class_counts_clean = (
+    st.session_state["clean_df"]["Class"].value_counts()
+)
+
+largest_class = class_counts_clean.idxmax()
+smallest_class = class_counts_clean.idxmin()
 
     st.write(
         f"데이터가 가장 많은 Class는 '{largest_class}' "
