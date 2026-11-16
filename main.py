@@ -76,16 +76,14 @@ TORQUE_CHANNELS = ["Tx", "Ty", "Tz"]
 
 def read_robot_data(file_object):
     """
-    UCI LP1 원본 형식과 일반적인 CSV 형식을 모두 읽는다.
+    UCI LP1 원본 형식과 일반적인 CSV 파일을 읽는다.
 
-    UCI 원본:
+    UCI 원본 구조:
     Class 이름 1줄
-    센서 측정값 15줄 (각 줄에 6개 값)
-
-    총 88개 데이터 × 90개 측정값
+    센서 측정값 6개씩 15줄
     """
 
-    import csv
+    import re
 
     if hasattr(file_object, "read"):
         raw_text = file_object.read()
@@ -98,171 +96,167 @@ def read_robot_data(file_object):
     if not raw_text.strip():
         raise ValueError("파일에 데이터가 없습니다.")
 
-    lines = raw_text.splitlines()
-
-    # 빈 줄 제거
-    lines = [line for line in lines if line.strip()]
+    lines = raw_text.replace("\ufeff", "").splitlines()
 
     # -----------------------------------------------------
-    # 1. UCI 원본 형식인지 확인
+    # 1. UCI 원본 데이터 형식 확인 및 읽기
     # -----------------------------------------------------
 
     samples = []
-    current_class = None
-    current_measurements = []
 
-    is_original_format = any(
-        line.startswith("\t") for line in lines
+    current_class = None
+    current_values = []
+
+    nonempty_lines = [
+        line for line in lines
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+    is_uci_format = (
+        len(nonempty_lines) >= 2
+        and not nonempty_lines[0][0].isspace()
+        and nonempty_lines[1][0].isspace()
+        and len(re.split(r"[\s,;]+", nonempty_lines[1].strip())) == 6
     )
 
-    if is_original_format:
+    if is_uci_format:
 
         for line in lines:
 
-            values = line.strip().split()
+            if not line.strip() or line.strip().startswith("#"):
+                continue
 
-            # 탭으로 시작하는 줄은 센서 측정값
-            if line.startswith("\t"):
+            # 들여쓰기가 있으면 센서 측정값
+            if line[0].isspace():
+
+                if current_class is None:
+                    raise ValueError(
+                        "Class 이름을 확인하기 전에 센서 데이터가 발견되었습니다."
+                    )
+
+                values = re.split(r"[\s,;]+", line.strip())
 
                 if len(values) != 6:
                     raise ValueError(
-                        "센서 측정 줄에는 6개의 값이 있어야 합니다. "
-                        f"현재 {len(values)}개입니다."
+                        "센서 측정 행에는 6개의 값이 있어야 합니다."
                     )
 
                 try:
-                    numbers = [float(v) for v in values]
+                    current_values.extend(
+                        [float(value) for value in values]
+                    )
                 except ValueError:
                     raise ValueError(
-                        "센서 측정값에 숫자가 아닌 값이 포함되어 있습니다."
+                        "센서 측정값에 숫자가 아닌 값이 있습니다."
                     )
 
-                current_measurements.extend(numbers)
+            # 들여쓰기가 없으면 새로운 Class
+            else:
 
-                # 15개 시점 × 6개 값 = 90개
-                if len(current_measurements) == 90:
+                # 이전 샘플 저장
+                if current_class is not None:
 
-                    if current_class is None:
+                    if len(current_values) != 90:
                         raise ValueError(
-                            "Class 이름이 측정값보다 먼저 나와야 합니다."
+                            f"Class '{current_class}'의 센서 데이터가 "
+                            f"90개가 아닙니다. 현재 {len(current_values)}개입니다."
                         )
 
                     samples.append(
-                        [current_class] + current_measurements
-                    )
-
-                    current_class = None
-                    current_measurements = []
-
-                elif len(current_measurements) > 90:
-                    raise ValueError(
-                        "한 데이터의 측정값이 90개를 초과했습니다."
-                    )
-
-            else:
-                # 새로운 Class 이름
-                if current_class is not None:
-                    raise ValueError(
-                        f"Class '{current_class}'의 측정값이 "
-                        "90개보다 적습니다."
+                        [current_class] + current_values
                     )
 
                 current_class = line.strip()
-                current_measurements = []
+                current_values = []
 
-        if current_class is not None or current_measurements:
-            raise ValueError(
-                "마지막 데이터의 측정값이 완성되지 않았습니다."
+        # 마지막 샘플 저장
+        if current_class is not None:
+
+            if len(current_values) != 90:
+                raise ValueError(
+                    f"마지막 Class '{current_class}'의 센서 데이터가 "
+                    f"90개가 아닙니다. 현재 {len(current_values)}개입니다."
+                )
+
+            samples.append(
+                [current_class] + current_values
             )
+
+        if not samples:
+            raise ValueError("유효한 LP1 데이터를 찾을 수 없습니다.")
 
         raw_df = pd.DataFrame(
             samples,
             columns=EXPECTED_COLUMNS
         )
 
-    # -----------------------------------------------------
-    # 2. 일반 CSV 형식
-    # -----------------------------------------------------
-
     else:
 
-        sample = lines[0]
+        # -------------------------------------------------
+        # 2. 일반적인 CSV 또는 91열 데이터 읽기
+        # -------------------------------------------------
 
-        # 쉼표, 세미콜론, 탭 구분자 확인
-        try:
-            delimiter = csv.Sniffer().sniff(
-                sample,
-                delimiters=",;\t"
-            ).delimiter
-        except csv.Error:
-            delimiter = None
+        raw_df = pd.read_csv(
+            StringIO(raw_text),
+            sep=r"[\s,;]+",
+            engine="python",
+            header=None,
+            comment="#",
+            on_bad_lines="error"
+        )
 
-        if delimiter is not None:
+        raw_df = raw_df.dropna(how="all").reset_index(drop=True)
 
-            raw_df = pd.read_csv(
-                StringIO(raw_text),
-                sep=delimiter,
-                engine="python"
-            )
+        if raw_df.empty:
+            raise ValueError("읽을 수 있는 데이터가 없습니다.")
 
-        else:
-
-            # 공백으로 구분된 파일
-            raw_df = pd.read_csv(
-                StringIO(raw_text),
-                sep=r"\s+",
-                engine="python",
-                header=None
-            )
-
-        raw_df.columns = [
-            str(c).strip().replace("\ufeff", "")
-            for c in raw_df.columns
+        # 헤더 확인
+        first_row = [
+            str(value).strip()
+            for value in raw_df.iloc[0].tolist()
         ]
 
-        # 헤더가 없는 91개 열 데이터
-        if len(raw_df.columns) == 91:
+        has_header = (
+            first_row[0].lower() in ["class", "label", "target"]
+        )
 
-            if set(raw_df.columns) != set(EXPECTED_COLUMNS):
-                raw_df.columns = EXPECTED_COLUMNS
+        if has_header:
 
-        else:
+            raw_df.columns = first_row
+            raw_df = raw_df.iloc[1:].reset_index(drop=True)
 
-            # Class 이름이 있는 경우 정리
-            first_column = raw_df.columns[0]
-
-            if first_column.lower() in [
-                "class", "label", "target"
-            ]:
-                raw_df = raw_df.rename(
-                    columns={first_column: "Class"}
-                )
+            raw_df.columns = [
+                "Class" if str(col).lower() in
+                ["class", "label", "target"]
+                else str(col)
+                for col in raw_df.columns
+            ]
 
             if len(raw_df.columns) != 91:
                 raise ValueError(
-                    "데이터는 Class 1개와 센서 측정값 90개, "
-                    f"총 91개 열이어야 합니다. "
-                    f"현재 {len(raw_df.columns)}개입니다."
+                    "헤더가 있는 CSV는 총 91개 컬럼이어야 합니다."
                 )
 
             if set(raw_df.columns) != set(EXPECTED_COLUMNS):
                 raise ValueError(
-                    "CSV 컬럼 이름이 예상한 구조와 다릅니다."
+                    "CSV의 컬럼 이름이 예상한 LP1 형식과 다릅니다."
                 )
 
             raw_df = raw_df[EXPECTED_COLUMNS]
 
-    # -----------------------------------------------------
-    # 3. 데이터 검증
-    # -----------------------------------------------------
+        else:
 
-    if raw_df.empty:
-        raise ValueError("읽을 수 있는 데이터가 없습니다.")
+            if raw_df.shape[1] != 91:
+                raise ValueError(
+                    f"데이터는 91개 열이어야 합니다. "
+                    f"현재 {raw_df.shape[1]}개입니다."
+                )
 
-    if len(raw_df.columns) != 91:
-        raise ValueError(
-            "최종 데이터의 컬럼 개수가 91개가 아닙니다."
-        )
+            raw_df.columns = EXPECTED_COLUMNS
+
+    # -----------------------------------------------------
+    # 3. 데이터 형식 최종 확인
+    # -----------------------------------------------------
 
     for column in FEATURES:
         raw_df[column] = pd.to_numeric(
@@ -272,19 +266,18 @@ def read_robot_data(file_object):
 
     if raw_df[FEATURES].isna().any().any():
         raise ValueError(
-            "센서 측정값에 결측치 또는 숫자가 아닌 값이 있습니다."
+            "센서 데이터에 결측치 또는 숫자가 아닌 값이 있습니다."
         )
 
-    raw_df["Class"] = (
-        raw_df["Class"]
-        .astype(str)
-        .str.strip()
-    )
+    raw_df["Class"] = raw_df["Class"].astype(str).str.strip()
 
-    if (raw_df["Class"] == "").any():
-        raise ValueError("Class 이름이 비어 있습니다.")
+    if raw_df["Class"].eq("").any():
+        raise ValueError("Class 이름이 비어 있는 데이터가 있습니다.")
 
-    return raw_df.reset_index(drop=True)
+    if len(raw_df) == 0:
+        raise ValueError("유효한 데이터가 없습니다.")
+
+    return raw_df
 
 
 @st.cache_data(show_spinner=False)
@@ -1611,8 +1604,8 @@ elif menu == "⑤ 모델 성능 평가":
 
     st.markdown("#### ④ 데이터 수와 클래스 불균형의 영향")
 
-largest_class = class_counts_clean.idxmax()
-smallest_class = class_counts_clean.idxmin()
+    largest_class = class_counts_clean.idxmax()
+    smallest_class = class_counts_clean.idxmin()
 
     st.write(
         f"데이터가 가장 많은 Class는 '{largest_class}' "
