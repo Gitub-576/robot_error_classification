@@ -60,8 +60,9 @@ def is_number(value):
 
 
 
+
 def read_robot_data(file_bytes):
-    """UCI LP1 원본의 16줄 구조를 1개 데이터 행으로 변환"""
+    """LP1 원본 데이터를 읽어 Class 1개 + 센서값 90개 구조로 변환"""
 
     decoded = None
 
@@ -84,14 +85,54 @@ def read_robot_data(file_bytes):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
 
-        # 들여쓰기된 줄은 센서 측정값
-        if line[0].isspace():
+        # 공백, 탭, 쉼표, 세미콜론 모두 구분자로 처리
+        values = re.split(r"[\s,;]+", line.strip())
+        values = [v for v in values if v]
 
-            values = re.split(r"[\s,;]+", line.strip())
-
-            if len(values) != 6:
+        # 한 줄에 Class + 센서값 90개가 있는 경우
+        if len(values) == 91:
+            if current_class is not None:
                 raise ValueError(
-                    f"{line_number}번째 줄에 센서값이 6개 있어야 합니다."
+                    f"{line_number}번째 줄 이전 데이터가 완성되지 않았습니다."
+                )
+
+            if not all(is_number(v) for v in values[1:]):
+                raise ValueError(
+                    f"{line_number}번째 줄의 센서값에 숫자가 아닌 값이 있습니다."
+                )
+
+            rows.append(
+                [values[0]] + [float(v) for v in values[1:]]
+            )
+            continue
+
+        # Class와 센서값 6개가 한 줄에 있는 경우
+        if len(values) == 7 and not is_number(values[0]):
+            if current_class is not None:
+                raise ValueError(
+                    f"{line_number}번째 줄에서 이전 Class의 센서값이 "
+                    "90개보다 적습니다."
+                )
+
+            current_class = values[0]
+            current_values = [float(v) for v in values[1:]]
+
+        # Class만 있는 줄
+        elif len(values) == 1 and not is_number(values[0]):
+            if current_class is not None:
+                raise ValueError(
+                    f"{line_number}번째 줄에서 이전 Class의 센서값이 "
+                    "90개보다 적습니다."
+                )
+
+            current_class = values[0]
+            current_values = []
+
+        # 센서 측정값 6개가 있는 줄
+        elif len(values) == 6:
+            if current_class is None:
+                raise ValueError(
+                    f"{line_number}번째 줄에 Class 정보가 없습니다."
                 )
 
             if not all(is_number(v) for v in values):
@@ -99,42 +140,43 @@ def read_robot_data(file_bytes):
                     f"{line_number}번째 줄에 숫자가 아닌 값이 있습니다."
                 )
 
-            if current_class is None:
-                raise ValueError("Class 정보가 센서값보다 먼저 있어야 합니다.")
-
             current_values.extend([float(v) for v in values])
 
-            if len(current_values) == 90:
-                rows.append([current_class] + current_values)
-                current_class = None
-                current_values = []
-
         else:
-            # 새로운 Class 시작
-            if current_class is not None:
-                raise ValueError(
-                    f"{current_class}의 센서값이 90개보다 적습니다."
-                )
+            raise ValueError(
+                f"{line_number}번째 줄의 데이터 형식을 확인해 주세요. "
+                f"현재 분리된 값의 개수: {len(values)}개"
+            )
 
-            current_class = line.strip()
+        # 센서값 90개가 모이면 데이터 한 행 완성
+        if current_class is not None and len(current_values) == 90:
+            rows.append([current_class] + current_values)
+            current_class = None
             current_values = []
 
+        elif current_class is not None and len(current_values) > 90:
+            raise ValueError(
+                f"{line_number}번째 줄에서 센서값이 90개를 초과했습니다."
+            )
+
     if current_class is not None:
-        raise ValueError("마지막 데이터의 센서값이 완성되지 않았습니다.")
+        raise ValueError(
+            f"마지막 Class {current_class}의 센서값이 90개보다 적습니다."
+        )
 
     if not rows:
         raise ValueError("읽을 수 있는 데이터가 없습니다.")
 
-    # 컬럼 이름 지정
     columns = ["Class"] + [
         f"{channel}{i}"
         for i in range(1, 16)
-        for channel in ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
+        for channel in CHANNELS
     ]
 
     parsed = pd.DataFrame(rows, columns=columns)
 
     return parsed, columns[1:]
+
 
 
 
