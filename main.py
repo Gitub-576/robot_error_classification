@@ -59,16 +59,12 @@ def is_number(value):
         return False
 
 
-def read_robot_data(file_bytes):
-    """
-    LP1 원본은 한 사례가 16줄로 저장된다.
-    첫 줄: Class 1개
-    다음 15줄: 각 시점의 센서값 6개(Fx, Fy, Fz, Tx, Ty, Tz)
-    따라서 한 사례는 총 1 + 15*6 = 91개의 값이다.
 
-    일반적인 CSV(한 행에 91개 값)도 함께 지원한다.
-    """
+def read_robot_data(file_bytes):
+    """UCI LP1 원본의 16줄 구조를 1개 데이터 행으로 변환"""
+
     decoded = None
+
     for encoding in ["utf-8-sig", "cp949", "latin1"]:
         try:
             decoded = file_bytes.decode(encoding)
@@ -77,112 +73,69 @@ def read_robot_data(file_bytes):
             continue
 
     if decoded is None:
-        raise ValueError("파일의 문자 인코딩을 읽을 수 없습니다.")
+        raise ValueError("파일 인코딩을 읽을 수 없습니다.")
 
-    # 1) 우선 일반 CSV처럼 한 행에 91개 열이 있는 형식인지 확인한다.
-    parsed = None
-    for separator in [",", "\t", r"\s+", ";"]:
-        try:
-            candidate = pd.read_csv(
-                io.StringIO(decoded),
-                sep=separator,
-                header=None,
-                engine="python",
-                comment="#"
-            )
-            if candidate.shape[1] == 91 and len(candidate) > 0:
-                parsed = candidate
-                break
-        except Exception:
-            pass
+    rows = []
+    current_class = None
+    current_values = []
 
-    # 2) UCI 원본 형식: Class 한 줄 + 센서값 15줄.
-    #    줄 단위 구분에 의존하지 않고 모든 숫자/레이블 토큰을 순서대로 모은다.
-    if parsed is None:
-        tokens = []
-        for line in decoded.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            # 공백, 탭, 쉼표, 세미콜론을 모두 구분자로 처리
-            tokens.extend([x for x in re.split(r"[\s,;]+", line) if x])
+    for line_number, line in enumerate(decoded.splitlines(), 1):
 
-        if not tokens:
-            raise ValueError("파일에 읽을 수 있는 데이터가 없습니다.")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
 
-        # 헤더가 포함된 파일은 첫 토큰이 Class/Label 등인지 확인
-        header_words = {"class", "target", "label", "분류", "정답"}
-        if tokens[0].strip().lower() in header_words:
-            tokens = tokens[1:]
-            # 헤더가 여러 줄로 된 91개 열 형식은 위 CSV 판별에서 처리되는 것이 일반적이다.
+        # 들여쓰기된 줄은 센서 측정값
+        if line[0].isspace():
 
-        if len(tokens) % 91 != 0:
-            raise ValueError(
-                "LP1 원본 데이터의 값 개수가 올바르지 않습니다. "
-                f"읽은 값은 {len(tokens)}개이며, 한 사례당 91개(Class 1개 + 센서값 90개)가 "
-                "필요합니다. 원본 lp1.data 파일 전체를 업로드했는지 확인해 주세요."
-            )
+            values = re.split(r"[\s,;]+", line.strip())
 
-        rows = []
-        for offset in range(0, len(tokens), 91):
-            sample = tokens[offset:offset + 91]
-            # 첫 값은 Class, 나머지 90개는 시간 순서대로 6개씩 15시점
-            rows.append(sample)
+            if len(values) != 6:
+                raise ValueError(
+                    f"{line_number}번째 줄에 센서값이 6개 있어야 합니다."
+                )
 
-        parsed = pd.DataFrame(rows, columns=make_default_columns())
+            if not all(is_number(v) for v in values):
+                raise ValueError(
+                    f"{line_number}번째 줄에 숫자가 아닌 값이 있습니다."
+                )
 
-    # 일반 CSV에 헤더가 포함된 경우를 처리
-    first_row = parsed.iloc[0].astype(str).str.strip().tolist()
-    first_cell = first_row[0].lower()
-    header_words = {"class", "target", "label", "분류", "정답"}
-    has_header = (
-        first_cell in header_words
-        or any(
-            re.fullmatch(r"(fx|fy|fz|tx|ty|tz)\d+", x.lower())
-            for x in first_row[1:]
-        )
-    )
-    if has_header:
-        columns = [str(x).strip() for x in first_row]
-        columns[0] = "Class"
-        parsed = parsed.iloc[1:].reset_index(drop=True)
-        parsed.columns = columns
-    elif list(parsed.columns) == list(range(91)):
-        parsed.columns = make_default_columns()
+            if current_class is None:
+                raise ValueError("Class 정보가 센서값보다 먼저 있어야 합니다.")
 
-    # 첫 번째 열을 정답 레이블로 통일
-    class_candidates = [
-        c for c in parsed.columns
-        if str(c).strip().lower() in {"class", "target", "label", "분류", "정답"}
+            current_values.extend([float(v) for v in values])
+
+            if len(current_values) == 90:
+                rows.append([current_class] + current_values)
+                current_class = None
+                current_values = []
+
+        else:
+            # 새로운 Class 시작
+            if current_class is not None:
+                raise ValueError(
+                    f"{current_class}의 센서값이 90개보다 적습니다."
+                )
+
+            current_class = line.strip()
+            current_values = []
+
+    if current_class is not None:
+        raise ValueError("마지막 데이터의 센서값이 완성되지 않았습니다.")
+
+    if not rows:
+        raise ValueError("읽을 수 있는 데이터가 없습니다.")
+
+    # 컬럼 이름 지정
+    columns = ["Class"] + [
+        f"{channel}{i}"
+        for i in range(1, 16)
+        for channel in ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
     ]
-    if class_candidates:
-        class_col = class_candidates[0]
-        if class_col != "Class":
-            parsed = parsed.rename(columns={class_col: "Class"})
-    else:
-        first_col = parsed.columns[0]
-        parsed = parsed.rename(columns={first_col: "Class"})
 
-    feature_cols = [c for c in parsed.columns if c != "Class"]
-    if len(feature_cols) != 90:
-        raise ValueError(
-            f"센서 측정값은 90개여야 하지만 {len(feature_cols)}개입니다. "
-            "원본 LP1 데이터인지 확인해 주세요."
-        )
+    parsed = pd.DataFrame(rows, columns=columns)
 
-    parsed["Class"] = parsed["Class"].astype(str).str.strip()
-    parsed.loc[parsed["Class"].isin(["", "nan", "None"]), "Class"] = np.nan
-    for col in feature_cols:
-        parsed[col] = pd.to_numeric(parsed[col], errors="coerce")
+    return parsed, columns[1:]
 
-    parsed = parsed.dropna(subset=["Class"]).reset_index(drop=True)
-    if parsed.empty:
-        raise ValueError("유효한 Class 값이 있는 데이터 행을 찾지 못했습니다.")
-
-    # 열 이름이 비표준인 업로드 파일도 예측 입력과 일치하도록 표준화
-    parsed.columns = ["Class"] + CANONICAL_FEATURES
-    feature_cols = CANONICAL_FEATURES.copy()
-    return parsed, feature_cols
 
 
 @st.cache_data(show_spinner=False)
