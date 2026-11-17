@@ -59,13 +59,12 @@ def is_number(value):
         return False
 
 
+
 def read_robot_data(file_bytes):
-    """
-    업로드한 CSV 또는 공백 구분 .data 파일을 읽는다.
-    91개 열(정답 Class 1개 + 센서값 90개)을 검사한다.
-    헤더가 없는 UCI 원본은 실제 원본 순서에 맞춰 컬럼명을 부여한다.
-    """
+    """UCI LP1 원본과 일반 CSV 파일을 읽는 함수"""
+
     decoded = None
+
     for encoding in ["utf-8-sig", "cp949", "latin1"]:
         try:
             decoded = file_bytes.decode(encoding)
@@ -74,13 +73,21 @@ def read_robot_data(file_bytes):
             continue
 
     if decoded is None:
-        raise ValueError("파일의 문자 인코딩을 읽을 수 없습니다.")
+        raise ValueError("파일 인코딩을 확인할 수 없습니다.")
+
+    lines = [
+        line.strip()
+        for line in decoded.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+    if not lines:
+        raise ValueError("데이터가 비어 있습니다.")
 
     parsed = None
-    errors = []
 
-    # 원본 .data의 공백 구분 및 일반 CSV 구분자를 차례로 시도
-    for separator in [r"\s+", ",", "\t", ";"]:
+    # 1. 일반 CSV 형식 확인
+    for separator in [",", ";", "\t"]:
         try:
             candidate = pd.read_csv(
                 io.StringIO(decoded),
@@ -89,74 +96,86 @@ def read_robot_data(file_bytes):
                 engine="python",
                 comment="#"
             )
+
             if candidate.shape[1] == 91:
                 parsed = candidate
                 break
-            errors.append(f"구분자 {separator}: {candidate.shape[1]}개 열")
-        except Exception as exc:
-            errors.append(str(exc))
 
+        except Exception:
+            pass
+
+    # 2. UCI 원본 형식 처리
+    # Class 1개 + 센서값 90개를 한 사례로 묶는다.
     if parsed is None:
-        raise ValueError(
-            "91개 열(Class 1개 + 센서 측정값 90개)을 찾지 못했습니다. "
-            "원본 LP1 파일인지, 구분자가 손상되지 않았는지 확인해 주세요. "
-            + " / ".join(errors[-3:])
+
+        tokens = []
+
+        for line in lines:
+            cleaned = (
+                line.replace(",", " ")
+                    .replace(";", " ")
+                    .replace("\t", " ")
+            )
+            tokens.extend(cleaned.split())
+
+        # 공백 구분 헤더가 있는 경우 제거
+        if tokens and tokens[0].lower() in {
+            "class", "target", "label", "분류", "정답"
+        }:
+            tokens = tokens[91:]
+
+        if len(tokens) == 0 or len(tokens) % 91 != 0:
+            raise ValueError(
+                f"데이터 값의 개수({len(tokens)})가 "
+                "91개 단위로 나누어지지 않습니다. "
+                "올바른 LP1 파일인지 확인해 주세요."
+            )
+
+        rows = [
+            tokens[i:i + 91]
+            for i in range(0, len(tokens), 91)
+        ]
+
+        parsed = pd.DataFrame(
+            rows,
+            columns=["Class"] + CANONICAL_FEATURES
         )
 
-    # 첫 행이 헤더인지 확인
-    first_row = parsed.iloc[0].astype(str).str.strip().tolist()
-    first_cell = first_row[0].lower()
-    header_words = {"class", "target", "label", "분류", "정답"}
-    has_header = (
-        first_cell in header_words
-        or any(re.match(r"^(fx|fy|fz|tx|ty|tz)\d+$", x.lower()) for x in first_row[1:])
-    )
+    # 3. 컬럼 이름 확인
+    if parsed.columns[0] != "Class":
+        first_row = parsed.iloc[0].astype(str).tolist()
 
-    if has_header:
-        columns = [str(x).strip() for x in first_row]
-        parsed = parsed.iloc[1:].reset_index(drop=True)
-        # 첫 번째 정답 컬럼 이름을 Class로 통일
-        columns[0] = "Class"
-        parsed.columns = columns
-    else:
-        parsed.columns = make_default_columns()
+        if first_row[0].strip().lower() in {
+            "class", "target", "label", "분류", "정답"
+        }:
+            parsed = parsed.iloc[1:].reset_index(drop=True)
 
-    # Class 열이 첫 번째가 아니어도 이름으로 찾는다.
-    class_candidates = [
-        c for c in parsed.columns
-        if str(c).strip().lower() in {"class", "target", "label", "분류", "정답"}
+        parsed.columns = ["Class"] + CANONICAL_FEATURES
+
+    # 4. 데이터 형식 정리
+    feature_cols = [
+        c for c in parsed.columns if c != "Class"
     ]
-    if class_candidates:
-        class_col = class_candidates[0]
-    else:
-        # UCI 원본 형식은 첫 열이 Class
-        class_col = parsed.columns[0]
-        parsed = parsed.rename(columns={class_col: "Class"})
-        class_col = "Class"
 
-    if class_col != "Class":
-        parsed = parsed.rename(columns={class_col: "Class"})
-
-    # 센서 측정값은 숫자로 변환. 변환 불가능한 값은 결측치로 처리한다.
-    feature_cols = [c for c in parsed.columns if c != "Class"]
     if len(feature_cols) != 90:
         raise ValueError(
-            f"센서 측정값이 90개여야 하지만 {len(feature_cols)}개입니다."
+            f"센서 측정값은 90개여야 하지만 "
+            f"{len(feature_cols)}개입니다."
         )
 
     parsed["Class"] = parsed["Class"].astype(str).str.strip()
-    parsed.loc[parsed["Class"].isin(["", "nan", "None"]), "Class"] = np.nan
 
     for col in feature_cols:
-        parsed[col] = pd.to_numeric(parsed[col], errors="coerce")
+        parsed[col] = pd.to_numeric(
+            parsed[col], errors="coerce"
+        )
 
     parsed = parsed.dropna(subset=["Class"]).reset_index(drop=True)
 
     if parsed.empty:
-        raise ValueError("유효한 Class 값이 있는 데이터 행을 찾지 못했습니다.")
+        raise ValueError("유효한 데이터가 없습니다.")
 
     return parsed, feature_cols
-
 
 @st.cache_data(show_spinner=False)
 def download_uci_lp1():
