@@ -1,12 +1,17 @@
+# -*- coding: utf-8 -*-
+"""
+산업용 로봇 오류 유형 분류 실습실
+실행: streamlit run main.py
+"""
 
-import streamlit as st
-import pandas as pd
+import io
+import re
+import requests
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import requests
-import re
-from io import StringIO
+import streamlit as st
 
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.pipeline import Pipeline
@@ -14,1836 +19,890 @@ from sklearn.impute import SimpleImputer
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
-    accuracy_score,
-    precision_recall_fscore_support,
-    classification_report,
-    confusion_matrix
+    accuracy_score, precision_recall_fscore_support,
+    classification_report, confusion_matrix
 )
 
-# =========================================================
-# 1. 기본 설정
-# =========================================================
-
+# ---------------------------------------------------------
+# 1. 기본 설정 및 데이터 불러오기
+# ---------------------------------------------------------
 st.set_page_config(
-    page_title="산업용 로봇 오류 유형 예측 실습실",
+    page_title="산업용 로봇 오류 유형 분류 실습실",
     page_icon="🤖",
     layout="wide"
 )
 
-st.title("🤖 산업용 로봇 오류 유형 예측 실습실")
-st.caption("기계공학 × 로봇·자동화 × 머신러닝 분류 프로젝트")
-
-st.markdown("""
-산업용 로봇에서 측정된 힘과 토크 데이터를 이용하여
-로봇의 정상 작동 및 오류 유형을 분류하는 프로그램입니다.
-
-**주의:** 이 프로그램은 오류 감지 이후 수집된 센서 데이터를 분류합니다.
-오류 발생 전의 미래 상태를 예측하는 프로그램은 아닙니다.
-""")
-
-st.divider()
-
-# =========================================================
-# 2. 데이터 관련 설정
-# =========================================================
-
-UCI_URL = (
-    "https://archive.ics.uci.edu/"
-    "ml/machine-learning-databases/robotfailure-mld/lp1.data"
+UCI_LP1_URL = (
+    "https://archive.ics.uci.edu/ml/"
+    "machine-learning-databases/robotfailure-mld/lp1.data"
 )
 
 CHANNELS = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
 
-# 원본 파일의 측정 순서:
-# 1번째 시점의 Fx, Fy, Fz, Tx, Ty, Tz
-# 2번째 시점의 Fx, Fy, Fz, Tx, Ty, Tz ...
-FEATURES = [
+# 원본 파일의 실제 순서: 각 시점마다 Fx, Fy, Fz, Tx, Ty, Tz
+CANONICAL_FEATURES = [
     f"{channel}{time}"
     for time in range(1, 16)
     for channel in CHANNELS
 ]
 
-EXPECTED_COLUMNS = ["Class"] + FEATURES
 
-FORCE_CHANNELS = ["Fx", "Fy", "Fz"]
-TORQUE_CHANNELS = ["Tx", "Ty", "Tz"]
-
-
-# =========================================================
-# 3. 데이터 읽기 및 형식 확인
-# =========================================================
+def make_default_columns():
+    return ["Class"] + CANONICAL_FEATURES
 
 
-def read_robot_data(file_object):
+def is_number(value):
+    try:
+        float(str(value).strip())
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def read_robot_data(file_bytes):
     """
-    UCI LP1 원본 형식과 일반적인 CSV 파일을 읽는다.
-
-    UCI 원본 구조:
-    Class 이름 1줄
-    센서 측정값 6개씩 15줄
+    업로드한 CSV 또는 공백 구분 .data 파일을 읽는다.
+    91개 열(정답 Class 1개 + 센서값 90개)을 검사한다.
+    헤더가 없는 UCI 원본은 실제 원본 순서에 맞춰 컬럼명을 부여한다.
     """
+    decoded = None
+    for encoding in ["utf-8-sig", "cp949", "latin1"]:
+        try:
+            decoded = file_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
 
-    import re
+    if decoded is None:
+        raise ValueError("파일의 문자 인코딩을 읽을 수 없습니다.")
 
-    if hasattr(file_object, "read"):
-        raw_text = file_object.read()
+    parsed = None
+    errors = []
 
-        if isinstance(raw_text, bytes):
-            raw_text = raw_text.decode("utf-8-sig", errors="replace")
-    else:
-        raw_text = str(file_object)
+    # 원본 .data의 공백 구분 및 일반 CSV 구분자를 차례로 시도
+    for separator in [r"\s+", ",", "\t", ";"]:
+        try:
+            candidate = pd.read_csv(
+                io.StringIO(decoded),
+                sep=separator,
+                header=None,
+                engine="python",
+                comment="#"
+            )
+            if candidate.shape[1] == 91:
+                parsed = candidate
+                break
+            errors.append(f"구분자 {separator}: {candidate.shape[1]}개 열")
+        except Exception as exc:
+            errors.append(str(exc))
 
-    if not raw_text.strip():
-        raise ValueError("파일에 데이터가 없습니다.")
+    if parsed is None:
+        raise ValueError(
+            "91개 열(Class 1개 + 센서 측정값 90개)을 찾지 못했습니다. "
+            "원본 LP1 파일인지, 구분자가 손상되지 않았는지 확인해 주세요. "
+            + " / ".join(errors[-3:])
+        )
 
-    lines = raw_text.replace("\ufeff", "").splitlines()
-
-    # -----------------------------------------------------
-    # 1. UCI 원본 데이터 형식 확인 및 읽기
-    # -----------------------------------------------------
-
-    samples = []
-
-    current_class = None
-    current_values = []
-
-    nonempty_lines = [
-        line for line in lines
-        if line.strip() and not line.strip().startswith("#")
-    ]
-
-    is_uci_format = (
-        len(nonempty_lines) >= 2
-        and not nonempty_lines[0][0].isspace()
-        and nonempty_lines[1][0].isspace()
-        and len(re.split(r"[\s,;]+", nonempty_lines[1].strip())) == 6
+    # 첫 행이 헤더인지 확인
+    first_row = parsed.iloc[0].astype(str).str.strip().tolist()
+    first_cell = first_row[0].lower()
+    header_words = {"class", "target", "label", "분류", "정답"}
+    has_header = (
+        first_cell in header_words
+        or any(re.match(r"^(fx|fy|fz|tx|ty|tz)\d+$", x.lower()) for x in first_row[1:])
     )
 
-    if is_uci_format:
-
-        for line in lines:
-
-            if not line.strip() or line.strip().startswith("#"):
-                continue
-
-            # 들여쓰기가 있으면 센서 측정값
-            if line[0].isspace():
-
-                if current_class is None:
-                    raise ValueError(
-                        "Class 이름을 확인하기 전에 센서 데이터가 발견되었습니다."
-                    )
-
-                values = re.split(r"[\s,;]+", line.strip())
-
-                if len(values) != 6:
-                    raise ValueError(
-                        "센서 측정 행에는 6개의 값이 있어야 합니다."
-                    )
-
-                try:
-                    current_values.extend(
-                        [float(value) for value in values]
-                    )
-                except ValueError:
-                    raise ValueError(
-                        "센서 측정값에 숫자가 아닌 값이 있습니다."
-                    )
-
-            # 들여쓰기가 없으면 새로운 Class
-            else:
-
-                # 이전 샘플 저장
-                if current_class is not None:
-
-                    if len(current_values) != 90:
-                        raise ValueError(
-                            f"Class '{current_class}'의 센서 데이터가 "
-                            f"90개가 아닙니다. 현재 {len(current_values)}개입니다."
-                        )
-
-                    samples.append(
-                        [current_class] + current_values
-                    )
-
-                current_class = line.strip()
-                current_values = []
-
-        # 마지막 샘플 저장
-        if current_class is not None:
-
-            if len(current_values) != 90:
-                raise ValueError(
-                    f"마지막 Class '{current_class}'의 센서 데이터가 "
-                    f"90개가 아닙니다. 현재 {len(current_values)}개입니다."
-                )
-
-            samples.append(
-                [current_class] + current_values
-            )
-
-        if not samples:
-            raise ValueError("유효한 LP1 데이터를 찾을 수 없습니다.")
-
-        raw_df = pd.DataFrame(
-            samples,
-            columns=EXPECTED_COLUMNS
-        )
-
+    if has_header:
+        columns = [str(x).strip() for x in first_row]
+        parsed = parsed.iloc[1:].reset_index(drop=True)
+        # 첫 번째 정답 컬럼 이름을 Class로 통일
+        columns[0] = "Class"
+        parsed.columns = columns
     else:
+        parsed.columns = make_default_columns()
 
-        # -------------------------------------------------
-        # 2. 일반적인 CSV 또는 91열 데이터 읽기
-        # -------------------------------------------------
+    # Class 열이 첫 번째가 아니어도 이름으로 찾는다.
+    class_candidates = [
+        c for c in parsed.columns
+        if str(c).strip().lower() in {"class", "target", "label", "분류", "정답"}
+    ]
+    if class_candidates:
+        class_col = class_candidates[0]
+    else:
+        # UCI 원본 형식은 첫 열이 Class
+        class_col = parsed.columns[0]
+        parsed = parsed.rename(columns={class_col: "Class"})
+        class_col = "Class"
 
-        raw_df = pd.read_csv(
-            StringIO(raw_text),
-            sep=r"[\s,;]+",
-            engine="python",
-            header=None,
-            comment="#",
-            on_bad_lines="error"
-        )
+    if class_col != "Class":
+        parsed = parsed.rename(columns={class_col: "Class"})
 
-        raw_df = raw_df.dropna(how="all").reset_index(drop=True)
-
-        if raw_df.empty:
-            raise ValueError("읽을 수 있는 데이터가 없습니다.")
-
-        # 헤더 확인
-        first_row = [
-            str(value).strip()
-            for value in raw_df.iloc[0].tolist()
-        ]
-
-        has_header = (
-            first_row[0].lower() in ["class", "label", "target"]
-        )
-
-        if has_header:
-
-            raw_df.columns = first_row
-            raw_df = raw_df.iloc[1:].reset_index(drop=True)
-
-            raw_df.columns = [
-                "Class" if str(col).lower() in
-                ["class", "label", "target"]
-                else str(col)
-                for col in raw_df.columns
-            ]
-
-            if len(raw_df.columns) != 91:
-                raise ValueError(
-                    "헤더가 있는 CSV는 총 91개 컬럼이어야 합니다."
-                )
-
-            if set(raw_df.columns) != set(EXPECTED_COLUMNS):
-                raise ValueError(
-                    "CSV의 컬럼 이름이 예상한 LP1 형식과 다릅니다."
-                )
-
-            raw_df = raw_df[EXPECTED_COLUMNS]
-
-        else:
-
-            if raw_df.shape[1] != 91:
-                raise ValueError(
-                    f"데이터는 91개 열이어야 합니다. "
-                    f"현재 {raw_df.shape[1]}개입니다."
-                )
-
-            raw_df.columns = EXPECTED_COLUMNS
-
-    # -----------------------------------------------------
-    # 3. 데이터 형식 최종 확인
-    # -----------------------------------------------------
-
-    for column in FEATURES:
-        raw_df[column] = pd.to_numeric(
-            raw_df[column],
-            errors="coerce"
-        )
-
-    if raw_df[FEATURES].isna().any().any():
+    # 센서 측정값은 숫자로 변환. 변환 불가능한 값은 결측치로 처리한다.
+    feature_cols = [c for c in parsed.columns if c != "Class"]
+    if len(feature_cols) != 90:
         raise ValueError(
-            "센서 데이터에 결측치 또는 숫자가 아닌 값이 있습니다."
+            f"센서 측정값이 90개여야 하지만 {len(feature_cols)}개입니다."
         )
 
-    raw_df["Class"] = raw_df["Class"].astype(str).str.strip()
+    parsed["Class"] = parsed["Class"].astype(str).str.strip()
+    parsed.loc[parsed["Class"].isin(["", "nan", "None"]), "Class"] = np.nan
 
-    if raw_df["Class"].eq("").any():
-        raise ValueError("Class 이름이 비어 있는 데이터가 있습니다.")
+    for col in feature_cols:
+        parsed[col] = pd.to_numeric(parsed[col], errors="coerce")
 
-    if len(raw_df) == 0:
-        raise ValueError("유효한 데이터가 없습니다.")
+    parsed = parsed.dropna(subset=["Class"]).reset_index(drop=True)
 
-    return raw_df
+    if parsed.empty:
+        raise ValueError("유효한 Class 값이 있는 데이터 행을 찾지 못했습니다.")
+
+    return parsed, feature_cols
 
 
 @st.cache_data(show_spinner=False)
-def download_uci_data():
-    response = requests.get(UCI_URL, timeout=20)
+def download_uci_lp1():
+    response = requests.get(UCI_LP1_URL, timeout=20)
     response.raise_for_status()
-    response.encoding = "utf-8"
-    return read_robot_data(response.text)
+    return response.content
 
 
-# =========================================================
-# 4. 사이드바: 데이터 불러오기
-# =========================================================
-
-st.sidebar.header("📂 데이터 설정")
-
-data_option = st.sidebar.radio(
-    "데이터 불러오기 방식",
-    ["UCI 원본 데이터 사용", "파일 직접 업로드"]
+# ---------------------------------------------------------
+# 2. 화면 상단
+# ---------------------------------------------------------
+st.title("🤖 산업용 로봇 오류 유형 분류 실습실")
+st.caption(
+    "힘·토크 센서 데이터로 로봇의 정상 작동 및 오류 유형을 분류하는 "
+    "머신러닝 프로젝트"
 )
 
-df = None
-
-if data_option == "UCI 원본 데이터 사용":
-
-    if st.sidebar.button("UCI 데이터 불러오기", type="primary"):
-        try:
-            st.session_state["robot_df"] = download_uci_data()
-        except Exception as e:
-            st.sidebar.error(
-                f"데이터를 불러오지 못했습니다.\n{e}"
-            )
-
-    if "robot_df" in st.session_state:
-        df = st.session_state["robot_df"]
-    else:
-        st.info(
-            "왼쪽 사이드바에서 'UCI 데이터 불러오기'를 눌러 주세요."
-        )
-
-else:
-    uploaded_file = st.sidebar.file_uploader(
-        "LP1 데이터 파일 선택",
-        type=["data", "txt", "csv"]
-    )
-
-    if uploaded_file is not None:
-        try:
-            df = read_robot_data(uploaded_file)
-            st.session_state["robot_df"] = df
-        except Exception as e:
-            st.error(f"데이터 파일을 읽는 중 오류가 발생했습니다.\n\n{e}")
-
-if df is None:
-    st.markdown("### 프로젝트를 시작해 보세요!")
-    st.info(
-        "데이터를 불러오면 프로젝트 소개, 데이터 확인, "
-        "시각화, 모델 학습 및 예측 기능을 사용할 수 있습니다."
-    )
-
-    st.markdown(
-        f"[UCI Robot Execution Failures 데이터셋 바로가기]({UCI_URL})"
-    )
-    st.stop()
-
-
-# =========================================================
-# 5. 데이터 기본 정보
-# =========================================================
-
-df = df.copy()
-
-# Class별 데이터 개수
-class_counts = df["Class"].value_counts()
-
-classes = sorted(
-    df["Class"].unique().tolist(),
-    key=lambda x: str(x)
+st.markdown(
+    """
+    이 프로그램은 UCI Machine Learning Repository의 **Robot Execution Failures**
+    데이터 중 LP1을 사용합니다. 15개 시점에서 측정한 6종류의 힘·토크 값,
+    총 90개 변수를 이용하여 `Class`를 예측합니다.
+    """
 )
-
-# 중복 데이터 개수
-duplicate_count = int(df.duplicated().sum())
-
-# 결측치 개수
-missing_count = int(df.isna().sum().sum())
-
-
-# =========================================================
-# 6. 메뉴 구성
-# =========================================================
-
-menu = st.sidebar.radio(
-    "📌 메뉴 선택",
-    [
-        "① 프로젝트 소개",
-        "② 데이터 확인",
-        "③ 데이터 탐색 및 시각화",
-        "④ 데이터 전처리 및 모델 학습",
-        "⑤ 모델 성능 평가",
-        "⑥ 로봇 오류 유형 예측"
-    ]
-)
-
-
-# =========================================================
-# 7. 프로젝트 소개
-# =========================================================
-
-if menu == "① 프로젝트 소개":
-
-    st.header("① 프로젝트 소개")
-
-    st.subheader("프로젝트 주제")
-    st.markdown("### 산업용 로봇의 작동 오류 유형 예측")
-
-    st.write("""
-    산업용 로봇은 물체를 집거나 이동시키는 과정에서
-    충돌이나 장애물 등의 문제를 경험할 수 있습니다.
-
-    이러한 상황에서 로봇의 센서가 측정하는 힘과 토크 데이터는
-    작동 상태를 파악하는 중요한 정보가 됩니다.
-
-    본 프로젝트에서는 힘과 토크 데이터를 머신러닝 모델에 학습시켜
-    로봇의 작동 상태 및 오류 유형을 분류합니다.
-    """)
-
-    st.subheader("프로젝트 목표")
-
-    st.markdown("""
-    1. 로봇의 힘과 토크 측정 데이터를 수집한다.
-    2. 데이터를 탐색하고 특징을 분석한다.
-    3. 머신러닝 분류 모델을 학습한다.
-    4. 두 모델의 성능을 비교하고 평가한다.
-    5. 새로운 센서 측정값으로 오류 유형을 분류한다.
-    """)
-
-    st.subheader("데이터 출처")
-
-    st.markdown("""
-    - 제공 기관: UCI Machine Learning Repository
-    - 데이터셋: Robot Execution Failures
-    - 사용 데이터: LP1
-    - 데이터 유형: 시계열 센서 데이터
-    - 관측 구간: 315ms
-    """)
-
-    st.markdown(
-        "[UCI 데이터셋 확인하기](https://archive.ics.uci.edu/dataset/138/robot+execution+failures)"
-    )
-
-    st.subheader("독립 변수와 종속 변수")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("#### 독립 변수 (X)")
-        st.info("""
-        총 90개의 센서 측정값
-
-        - Fx: X축 방향 힘
-        - Fy: Y축 방향 힘
-        - Fz: Z축 방향 힘
-        - Tx: X축 방향 토크
-        - Ty: Y축 방향 토크
-        - Tz: Z축 방향 토크
-
-        각 센서를 15개 시점에서 측정합니다.
-        """)
-
-    with col2:
-        st.markdown("#### 종속 변수 (Y)")
-        st.success("""
-        Class
-
-        로봇의 정상 작동 또는 오류 유형을
-        나타내는 정답 레이블입니다.
-
-        모델은 90개의 센서 측정값을 이용하여
-        Class를 분류합니다.
-        """)
-
-    st.subheader("머신러닝 분류 원리")
-
-    st.write("""
-    각 데이터 행에는 로봇의 힘과 토크 측정값 90개가 기록되어 있습니다.
-
-    머신러닝 모델은 이 측정값과 실제 Class 사이의 관계를 학습합니다.
-
-    학습이 끝나면 새로운 센서 측정값을 입력했을 때
-    학습한 패턴과 비교하여 가장 가능성이 높은 Class를 출력합니다.
-    """)
-
-    st.subheader("사용 모델")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("**의사결정나무 (Decision Tree)**")
-        st.write("""
-        여러 조건을 차례대로 나누면서
-        데이터를 분류하는 모델입니다.
-        """)
-
-    with col2:
-        st.markdown("**랜덤 포레스트 (Random Forest)**")
-        st.write("""
-        여러 의사결정나무를 학습시키고
-        그 결과를 종합하여 분류하는 모델입니다.
-        """)
-
-    st.divider()
-
-    st.caption(
-        f"현재 불러온 데이터: {len(df)}개 행 / "
-        f"{len(FEATURES)}개 독립 변수 / {len(classes)}개 Class"
-    )
-
-
-# =========================================================
-# 8. 데이터 확인
-# =========================================================
-
-elif menu == "② 데이터 확인":
-
-    st.header("② 데이터 확인")
-
-    st.subheader("데이터 기본 정보")
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric("전체 데이터 수", f"{len(df):,}개")
-    c2.metric("전체 컬럼 수", f"{df.shape[1]}개")
-    c3.metric("결측치", f"{missing_count}개")
-    c4.metric("중복 데이터", f"{duplicate_count}개")
-
-    st.divider()
-
-    st.subheader("데이터 상위 5개")
-
-    st.dataframe(
-        df.head(),
-        use_container_width=True
-    )
-
-    st.subheader("컬럼 이름과 자료형")
-
-    info_df = pd.DataFrame({
-        "컬럼 이름": df.columns,
-        "자료형": [str(df[col].dtype) for col in df.columns],
-        "결측치 수": [int(df[col].isna().sum()) for col in df.columns]
-    })
-
-    st.dataframe(info_df, use_container_width=True)
-
-    st.divider()
-
-    st.subheader("Class별 데이터 개수")
-
-    class_df = class_counts.reset_index()
-    class_df.columns = ["Class", "데이터 개수"]
-
-    st.dataframe(class_df, use_container_width=True)
-
-    fig = px.bar(
-        class_df,
-        x="Class",
-        y="데이터 개수",
-        color="Class",
-        text="데이터 개수",
-        title="Class별 데이터 개수"
-    )
-
-    fig.update_layout(
-        xaxis_title="Class",
-        yaxis_title="데이터 개수",
-        showlegend=False
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    if class_counts.nunique() > 1:
-        st.warning(
-            "Class마다 데이터 개수가 다릅니다. "
-            "클래스 불균형이 모델 성능에 영향을 줄 수 있습니다."
-        )
-    else:
-        st.success("모든 Class의 데이터 개수가 같습니다.")
-
-
-# =========================================================
-# 9. 데이터 탐색 및 시각화
-# =========================================================
-
-elif menu == "③ 데이터 탐색 및 시각화":
-
-    st.header("③ 데이터 탐색 및 시각화")
-
-    st.write("""
-    센서 측정값의 분포와 Class별 차이를 시각적으로 확인합니다.
-    """)
-
-    # 1. Class별 개수
-    st.subheader("1. Class별 데이터 개수")
-
-    class_df = class_counts.reset_index()
-    class_df.columns = ["Class", "개수"]
-
-    fig1 = px.bar(
-        class_df,
-        x="Class",
-        y="개수",
-        color="Class",
-        text="개수",
-        title="Class별 데이터 분포"
-    )
-
-    st.plotly_chart(fig1, use_container_width=True)
-
-    st.caption(
-        f"전체 {len(df)}개 데이터가 {len(classes)}개의 Class로 구성되어 있습니다. "
-        "막대 높이를 비교하여 클래스별 데이터 불균형 여부를 확인할 수 있습니다."
-    )
-
-    st.divider()
-
-    # 센서 데이터를 긴 형태로 변환
-    def make_long_data(data, channels):
-        result = []
-
-        for channel in channels:
-            cols = [f"{channel}{i}" for i in range(1, 16)]
-
-            temp = data[["Class"] + cols].copy()
-
-            long = temp.melt(
-                id_vars="Class",
-                value_vars=cols,
-                var_name="측정 시점",
-                value_name="측정값"
-            )
-
-            long["센서 축"] = channel
-            long["측정 시점"] = long["측정 시점"].str.extract(
-                r"(\d+)"
-            ).astype(int)
-
-            result.append(long)
-
-        return pd.concat(result, ignore_index=True)
-
-    # 2. 힘 데이터 분포
-    st.subheader("2. X축·Y축·Z축 힘 데이터 분포")
-
-    force_long = make_long_data(df, FORCE_CHANNELS)
-
-    fig2 = px.box(
-        force_long,
-        x="센서 축",
-        y="측정값",
-        color="센서 축",
-        points="outliers",
-        title="힘 센서 측정값 분포"
-    )
-
-    fig2.update_layout(
-        xaxis_title="힘의 방향",
-        yaxis_title="힘 측정값"
-    )
-
-    st.plotly_chart(fig2, use_container_width=True)
-
-    st.caption(
-        "각 축의 힘 측정값이 어느 범위에 분포하는지 확인할 수 있습니다. "
-        "상자와 수염의 범위가 넓을수록 측정값의 변동이 큰 편입니다."
-    )
-
-    st.divider()
-
-    # 3. 토크 데이터 분포
-    st.subheader("3. X축·Y축·Z축 토크 데이터 분포")
-
-    torque_long = make_long_data(df, TORQUE_CHANNELS)
-
-    fig3 = px.box(
-        torque_long,
-        x="센서 축",
-        y="측정값",
-        color="센서 축",
-        points="outliers",
-        title="토크 센서 측정값 분포"
-    )
-
-    fig3.update_layout(
-        xaxis_title="토크의 방향",
-        yaxis_title="토크 측정값"
-    )
-
-    st.plotly_chart(fig3, use_container_width=True)
-
-    st.caption(
-        "각 방향의 토크 측정값의 중앙값과 분포 범위를 비교할 수 있습니다."
-    )
-
-    st.divider()
-
-    # 각 행의 15개 측정값 평균을 계산
-    def make_axis_average(data, channels, kind):
-        result = []
-
-        for channel in channels:
-            cols = [f"{channel}{i}" for i in range(1, 16)]
-
-            temp = pd.DataFrame({
-                "Class": data["Class"],
-                "측정값 평균": data[cols].mean(axis=1),
-                "센서 축": channel
-            })
-
-            result.append(temp)
-
-        return pd.concat(result, ignore_index=True)
-
-    # 4. Class별 힘 비교
-    st.subheader("4. Class별 힘 측정값 비교")
-
-    force_avg = make_axis_average(
-        df, FORCE_CHANNELS, "힘"
-    )
-
-    fig4 = px.box(
-        force_avg,
-        x="Class",
-        y="측정값 평균",
-        color="Class",
-        facet_col="센서 축",
-        title="Class별 힘 측정값 평균 비교"
-    )
-
-    fig4.update_layout(
-        showlegend=False,
-        xaxis_title="Class",
-        yaxis_title="15개 시점의 힘 평균"
-    )
-
-    st.plotly_chart(fig4, use_container_width=True)
-
-    st.caption(
-        "각 Class에서 X·Y·Z축 힘의 평균이 어떻게 다른지 비교합니다. "
-        "Class별 분포 차이가 크다면 오류 유형을 구분하는 특징이 될 가능성이 있습니다."
-    )
-
-    st.divider()
-
-    # 5. Class별 토크 비교
-    st.subheader("5. Class별 토크 측정값 비교")
-
-    torque_avg = make_axis_average(
-        df, TORQUE_CHANNELS, "토크"
-    )
-
-    fig5 = px.box(
-        torque_avg,
-        x="Class",
-        y="측정값 평균",
-        color="Class",
-        facet_col="센서 축",
-        title="Class별 토크 측정값 평균 비교"
-    )
-
-    fig5.update_layout(
-        showlegend=False,
-        xaxis_title="Class",
-        yaxis_title="15개 시점의 토크 평균"
-    )
-
-    st.plotly_chart(fig5, use_container_width=True)
-
-    st.caption(
-        "각 Class의 X·Y·Z축 토크 평균 분포를 비교합니다. "
-        "서로 다른 오류 유형 사이에서 토크 특성에 차이가 있는지 확인할 수 있습니다."
-    )
-
-    st.divider()
-
-    st.info(
-        "그래프는 데이터의 경향을 탐색하기 위한 것입니다. "
-        "분포가 다르다는 사실만으로 특정 센서값이 오류의 원인이라고 "
-        "단정할 수는 없습니다."
-    )
-
-
-# =========================================================
-# 10. 전처리 및 모델 학습
-# =========================================================
-
-elif menu == "④ 데이터 전처리 및 모델 학습":
-
-    st.header("④ 데이터 전처리 및 모델 학습")
-
-    st.subheader("전처리 과정")
-
-    st.markdown("""
-    1. Class와 센서 데이터를 분리한다.
-    2. 완전히 동일한 중복 데이터를 제거한다.
-    3. 학습 데이터와 테스트 데이터를 8:2로 분리한다.
-    4. 학습 데이터의 결측치 처리 기준을 학습한다.
-    5. 의사결정나무와 랜덤 포레스트를 학습한다.
-
-    **데이터 누수 방지:** 결측치 대체 기준은 학습 데이터에서만 계산합니다.
-    테스트 데이터는 모델 평가를 위해 분리해 둡니다.
-    """)
-
-    st.write("### 데이터 현황")
-
-    c1, c2, c3 = st.columns(3)
-
-    c1.metric("원본 행 수", len(df))
-    c2.metric("중복 행 수", duplicate_count)
-    c3.metric("사용 가능한 변수", len(FEATURES))
-
-    # 중복 데이터 제거
-    clean_df = df.drop_duplicates().copy()
-
-    if len(clean_df) < len(df):
-        st.warning(
-            f"중복 데이터 {len(df) - len(clean_df)}개를 제거했습니다."
-        )
-
-    # 독립 변수와 종속 변수 분리
-    X = clean_df[FEATURES].copy()
-    y = clean_df["Class"].copy()
-
-    st.write("### 독립 변수와 종속 변수")
-
-    st.write(f"- 독립 변수 X: {X.shape[1]}개")
-    st.write(f"- 종속 변수 Y: Class")
-    st.write(f"- 분석 데이터: {len(clean_df)}개")
-
-    class_counts_clean = y.value_counts()
-
-    st.write("### 전처리 후 Class별 개수")
-
-    st.dataframe(
-        class_counts_clean.rename("개수").reset_index(),
-        use_container_width=True
-    )
-
-    # 층화 분할 가능 여부 확인
-    min_class_count = int(class_counts_clean.min())
-
-    if len(classes) < 2:
-        st.error("분류를 위해서는 최소 2개 이상의 Class가 필요합니다.")
-        st.stop()
-
-    if min_class_count < 2:
-        st.error(
-            "특정 Class의 데이터가 2개 미만이므로 "
-            "층화 학습·테스트 분할을 진행할 수 없습니다."
-        )
-        st.stop()
-
-    # 데이터 분할 비율 설정
-    test_ratio = st.slider(
-        "테스트 데이터 비율",
-        min_value=0.1,
-        max_value=0.4,
-        value=0.2,
-        step=0.05
-    )
-
-    random_state = 42
-
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X,
-            y,
-            test_size=test_ratio,
-            random_state=random_state,
-            stratify=y
-        )
-
-    except ValueError as e:
-        st.error(
-            f"층화 데이터 분할에 실패했습니다.\n\n{e}\n\n"
-            "테스트 비율을 조정하거나 데이터를 추가해 주세요."
-        )
-        st.stop()
-
-    st.success("층화 데이터 분할이 완료되었습니다.")
-
-    c1, c2 = st.columns(2)
-
-    c1.metric("학습 데이터", f"{len(X_train)}개")
-    c2.metric("테스트 데이터", f"{len(X_test)}개")
-
-    st.caption(
-        "층화 분할을 사용하여 학습 데이터와 테스트 데이터에 "
-        "Class별 비율이 최대한 비슷하게 유지되도록 했습니다."
-    )
-
-    st.divider()
-
-    st.subheader("모델 학습")
-
-    st.write("""
-    두 모델 모두 동일한 학습 데이터와 테스트 데이터를 사용합니다.
-
-    - 의사결정나무: 조건에 따라 데이터를 나누는 방식
-    - 랜덤 포레스트: 여러 의사결정나무의 결과를 종합하는 방식
-    """)
-
-    # 전처리와 모델을 하나의 Pipeline으로 구성
-    # SimpleImputer는 학습 데이터의 중앙값만 학습한다.
-    models = {
-        "의사결정나무": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("model", DecisionTreeClassifier(
-                random_state=random_state,
-                class_weight="balanced"
-            ))
-        ]),
-
-        "랜덤 포레스트": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("model", RandomForestClassifier(
-                n_estimators=200,
-                random_state=random_state,
-                class_weight="balanced",
-                n_jobs=-1
-            ))
-        ])
-    }
-
-    if st.button("🚀 두 모델 학습 및 평가 시작", type="primary"):
-
-        result = {}
-
-        progress = st.progress(0)
-
-        for i, (name, model) in enumerate(models.items()):
-
-            model.fit(X_train, y_train)
-
-            pred = model.predict(X_test)
-
-            accuracy = accuracy_score(y_test, pred)
-
-            precision_macro, recall_macro, f1_macro, _ = (
-                precision_recall_fscore_support(
-                    y_test,
-                    pred,
-                    average="macro",
-                    zero_division=0
-                )
-            )
-
-            precision_weighted, recall_weighted, f1_weighted, _ = (
-                precision_recall_fscore_support(
-                    y_test,
-                    pred,
-                    average="weighted",
-                    zero_division=0
-                )
-            )
-
-            report = classification_report(
-                y_test,
-                pred,
-                labels=classes,
-                output_dict=True,
-                zero_division=0
-            )
-
-            matrix = confusion_matrix(
-                y_test,
-                pred,
-                labels=classes
-            )
-
-            result[name] = {
-                "model": model,
-                "prediction": pred,
-                "accuracy": accuracy,
-                "precision_macro": precision_macro,
-                "recall_macro": recall_macro,
-                "f1_macro": f1_macro,
-                "precision_weighted": precision_weighted,
-                "recall_weighted": recall_weighted,
-                "f1_weighted": f1_weighted,
-                "report": report,
-                "matrix": matrix
-            }
-
-            progress.progress((i + 1) / 2)
-
-        # Macro F1을 우선으로 최종 모델 선택
-        # 동점이면 정확도를 비교한다.
-        best_name = max(
-            result.keys(),
-            key=lambda name: (
-                result[name]["f1_macro"],
-                result[name]["accuracy"]
-            )
-        )
-
-        best_model = result[best_name]["model"]
-
-        # 성능 평가와 별도로 전체 데이터로 최종 예측 모델 학습
-        final_model = Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("model", (
-                RandomForestClassifier(
-                    n_estimators=200,
-                    random_state=random_state,
-                    class_weight="balanced",
-                    n_jobs=-1
-                )
-                if best_name == "랜덤 포레스트"
-                else DecisionTreeClassifier(
-                    random_state=random_state,
-                    class_weight="balanced"
-                )
-            ))
-        ])
-
-        final_model.fit(X, y)
-
-        # 교차 검증
-        cv_result = None
-        cv_reason = None
-
-        min_train_class = int(y_train.value_counts().min())
-
-        # 전체 데이터에 대한 교차 검증 가능 조건
-        if min_class_count >= 2:
-
-            n_splits = min(5, min_class_count)
-
-            cv = StratifiedKFold(
-                n_splits=n_splits,
-                shuffle=True,
-                random_state=random_state
-            )
-
-            try:
-                scores = cross_val_score(
-                    best_model,
-                    X,
-                    y,
-                    cv=cv,
-                    scoring="f1_macro",
-                    n_jobs=1,
-                    error_score="raise"
-                )
-
-                cv_result = {
-                    "folds": n_splits,
-                    "mean": float(np.mean(scores)),
-                    "std": float(np.std(scores)),
-                    "scores": scores.tolist()
-                }
-
-            except Exception as e:
-                cv_reason = str(e)
-
-        else:
-            cv_reason = "일부 Class의 데이터가 부족합니다."
-
-        # 세션에 결과 저장
-        st.session_state["model_results"] = result
-        st.session_state["best_name"] = best_name
-        st.session_state["final_model"] = final_model
-        st.session_state["X_test"] = X_test
-        st.session_state["y_test"] = y_test
-        st.session_state["classes"] = classes
-        st.session_state["clean_df"] = clean_df
-        st.session_state["cv_result"] = cv_result
-        st.session_state["cv_reason"] = cv_reason
-        st.session_state["train_size"] = len(X_train)
-        st.session_state["test_size"] = len(X_test)
-        st.session_state["split_ratio"] = test_ratio
-
-        st.success("두 모델의 학습 및 평가가 완료되었습니다!")
-
-        st.balloons()
-
-    # 이전에 학습한 결과가 있다면 표시
-    if "model_results" in st.session_state:
-
-        st.divider()
-        st.subheader("학습 결과 요약")
-
-        result = st.session_state["model_results"]
-
-        comparison = []
-
-        for name, r in result.items():
-
-            comparison.append({
-                "모델": name,
-                "정확도": r["accuracy"],
-                "Macro F1-score": r["f1_macro"],
-                "Weighted F1-score": r["f1_weighted"]
-            })
-
-        comparison_df = pd.DataFrame(comparison)
-
-        st.dataframe(
-            comparison_df.style.format({
-                "정확도": "{:.4f}",
-                "Macro F1-score": "{:.4f}",
-                "Weighted F1-score": "{:.4f}"
-            }),
-            use_container_width=True
-        )
-
-        st.success(
-            f"현재 선택된 최종 모델: {st.session_state['best_name']}"
-        )
-
-        st.info(
-            "상세한 성능 평가 및 자동 결과 해석은 "
-            "왼쪽 메뉴의 '⑤ 모델 성능 평가'에서 확인할 수 있습니다."
-        )
-
-
-# =========================================================
-# 11. 모델 성능 평가
-# =========================================================
-
-elif menu == "⑤ 모델 성능 평가":
-
-    st.header("⑤ 모델 성능 평가")
-
-    if "model_results" not in st.session_state:
-        st.warning(
-            "먼저 '④ 데이터 전처리 및 모델 학습'에서 "
-            "모델을 학습해 주세요."
-        )
-        st.stop()
-
-    result = st.session_state["model_results"]
-    best_name = st.session_state["best_name"]
-
-    X_test = st.session_state["X_test"]
-    y_test = st.session_state["y_test"]
-    cv_result = st.session_state["cv_result"]
-
-    st.success(f"최종 선택 모델: {best_name}")
-
-    st.caption(
-        f"실제 테스트 데이터 {len(X_test)}개를 사용한 평가 결과입니다."
-    )
-
-    # 두 모델 비교
-    st.subheader("1. 두 모델의 성능 비교")
-
-    comparison = []
-
-    for name, r in result.items():
-
-        comparison.append({
-            "모델": name,
-            "정확도": r["accuracy"],
-            "Macro 정밀도": r["precision_macro"],
-            "Macro 재현율": r["recall_macro"],
-            "Macro F1": r["f1_macro"],
-            "Weighted F1": r["f1_weighted"]
-        })
-
-    comparison_df = pd.DataFrame(comparison)
-
-    st.dataframe(
-        comparison_df.style.format({
-            col: "{:.4f}"
-            for col in comparison_df.columns
-            if col != "모델"
-        }),
-        use_container_width=True
-    )
-
-    fig_compare = px.bar(
-        comparison_df.melt(
-            id_vars="모델",
-            var_name="평가 지표",
-            value_name="점수"
-        ),
-        x="평가 지표",
-        y="점수",
-        color="모델",
-        barmode="group",
-        title="모델별 성능 지표 비교",
-        range_y=[0, 1]
-    )
-
-    st.plotly_chart(fig_compare, use_container_width=True)
-
-    st.divider()
-
-    # 모델 선택
-    selected_name = st.selectbox(
-        "상세 평가를 확인할 모델",
-        list(result.keys()),
-        index=list(result.keys()).index(best_name)
-    )
-
-    r = result[selected_name]
-
-    # 핵심 지표
-    st.subheader("2. 주요 성능 평가 지표")
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric("정확도", f"{r['accuracy']:.4f}")
-    c2.metric("Macro 정밀도", f"{r['precision_macro']:.4f}")
-    c3.metric("Macro 재현율", f"{r['recall_macro']:.4f}")
-    c4.metric("Macro F1-score", f"{r['f1_macro']:.4f}")
-
-    st.write("### 전체 성능")
-
-    overall_df = pd.DataFrame([
-        {
-            "평균 방식": "Macro 평균",
-            "정밀도": r["precision_macro"],
-            "재현율": r["recall_macro"],
-            "F1-score": r["f1_macro"]
-        },
-        {
-            "평균 방식": "Weighted 평균",
-            "정밀도": r["precision_weighted"],
-            "재현율": r["recall_weighted"],
-            "F1-score": r["f1_weighted"]
-        }
-    ])
-
-    st.dataframe(
-        overall_df.style.format({
-            "정밀도": "{:.4f}",
-            "재현율": "{:.4f}",
-            "F1-score": "{:.4f}"
-        }),
-        use_container_width=True
-    )
-
-    st.caption("""
-    Macro 평균은 모든 Class의 성능을 동일한 비중으로 평균한 값입니다.
-    Weighted 평균은 각 Class의 데이터 개수를 고려하여 평균한 값입니다.
-    따라서 클래스 불균형이 있을 때 두 결과를 함께 확인하는 것이 중요합니다.
-    """)
-
-    st.divider()
-
-    # 클래스별 평가
-    st.subheader("3. Class별 성능")
-
-    report = r["report"]
-
-    per_class = []
-
-    for class_name in classes:
-
-        item = report[str(class_name)]
-
-        per_class.append({
-            "Class": class_name,
-            "정밀도": item["precision"],
-            "재현율": item["recall"],
-            "F1-score": item["f1-score"],
-            "실제 데이터 수": int(item["support"])
-        })
-
-    per_class_df = pd.DataFrame(per_class)
-
-    st.dataframe(
-        per_class_df.style.format({
-            "정밀도": "{:.4f}",
-            "재현율": "{:.4f}",
-            "F1-score": "{:.4f}"
-        }),
-        use_container_width=True
-    )
-
-    fig_class = px.bar(
-        per_class_df.melt(
-            id_vars="Class",
-            value_vars=["정밀도", "재현율", "F1-score"],
-            var_name="평가 지표",
-            value_name="점수"
-        ),
-        x="Class",
-        y="점수",
-        color="평가 지표",
-        barmode="group",
-        title="Class별 성능 비교",
-        range_y=[0, 1]
-    )
-
-    st.plotly_chart(fig_class, use_container_width=True)
-
-    st.divider()
-
-    # 혼동 행렬
-    st.subheader("4. 혼동 행렬 (Confusion Matrix)")
-
-    matrix = r["matrix"]
-
-    fig_matrix = px.imshow(
-        matrix,
-        x=[str(c) for c in classes],
-        y=[str(c) for c in classes],
-        text_auto=True,
-        color_continuous_scale="Blues",
-        labels={
-            "x": "예측한 Class",
-            "y": "실제 Class",
-            "color": "데이터 개수"
-        },
-        title="실제 Class와 예측 Class 비교"
-    )
-
-    st.plotly_chart(fig_matrix, use_container_width=True)
-
-    st.caption("""
-    혼동 행렬의 세로축은 실제 Class, 가로축은 모델이 예측한 Class입니다.
-    대각선에 있는 숫자가 클수록 올바르게 분류한 데이터가 많다는 의미입니다.
-    대각선 바깥의 숫자는 다른 Class로 잘못 분류한 데이터입니다.
-    """)
-
-    # 오분류 분석
-    errors = []
-
-    for i, actual in enumerate(classes):
-
-        for j, predicted in enumerate(classes):
-
-            if i != j and matrix[i, j] > 0:
-
-                errors.append({
-                    "실제 Class": actual,
-                    "잘못 예측한 Class": predicted,
-                    "오분류 개수": int(matrix[i, j])
-                })
-
-    if errors:
-
-        error_df = pd.DataFrame(errors).sort_values(
-            "오분류 개수",
-            ascending=False
-        )
-
-        st.write("### 주요 오분류 유형")
-
-        st.dataframe(
-            error_df,
-            use_container_width=True
-        )
-
-        most_error = error_df.iloc[0]
-
-        st.warning(
-            f"가장 많이 발생한 오분류는 실제 Class "
-            f"'{most_error['실제 Class']}'를 "
-            f"'{most_error['잘못 예측한 Class']}'로 "
-            f"분류한 경우이며, {most_error['오분류 개수']}개입니다."
-        )
-
-    else:
-        st.success("테스트 데이터에서 오분류가 발생하지 않았습니다.")
-
-    st.divider()
-
-    # 교차 검증
-    st.subheader("5. Stratified K-Fold 교차 검증")
-
-    if cv_result is not None:
-
-        c1, c2 = st.columns(2)
-
-        c1.metric(
-            "교차 검증 평균 Macro F1",
-            f"{cv_result['mean']:.4f}"
-        )
-
-        c2.metric(
-            "표준편차",
-            f"{cv_result['std']:.4f}"
-        )
-
-        st.write(
-            f"교차 검증 횟수: {cv_result['folds']}회"
-        )
-
-        cv_df = pd.DataFrame({
-            "검증 회차": [
-                f"{i + 1}회차"
-                for i in range(cv_result["folds"])
-            ],
-            "Macro F1-score": cv_result["scores"]
-        })
-
-        fig_cv = px.bar(
-            cv_df,
-            x="검증 회차",
-            y="Macro F1-score",
-            text="Macro F1-score",
-            title="교차 검증 회차별 성능"
-        )
-
-        st.plotly_chart(fig_cv, use_container_width=True)
-
-        st.caption(
-            "평균은 교차 검증의 전반적인 성능을 나타내며, "
-            "표준편차가 작을수록 각 검증 과정의 성능 차이가 작은 편입니다."
-        )
-
-    else:
-        st.warning(
-            "교차 검증을 수행할 수 없었습니다. "
-            + str(st.session_state["cv_reason"])
-        )
-
-    st.divider()
-
-    # =====================================================
-    # 12. 실제 지표를 이용한 자동 해석
-    # =====================================================
-
-    st.subheader("6. 성능 평가 결과 해석")
-
-    acc = r["accuracy"]
-    precision = r["precision_macro"]
-    recall = r["recall_macro"]
-    f1 = r["f1_macro"]
-    weighted_f1 = r["f1_weighted"]
-
-    # 1. 정확도 해석
-    st.markdown("#### ① 정확도 (Accuracy)")
-
-    st.write(
-        f"정확도는 전체 테스트 데이터 중 올바르게 분류한 "
-        f"데이터의 비율입니다. 이번 모델의 정확도는 "
-        f"{acc:.4f}({acc * 100:.2f}%)입니다."
-    )
-
-    st.write(
-        f"테스트 데이터 {len(y_test)}개 중 "
-        f"{int(round(acc * len(y_test)))}개를 올바르게 분류했습니다."
-    )
-
-    # 2. 정밀도 및 재현율
-    st.markdown("#### ② 정밀도와 재현율")
-
-    st.write(
-        f"Macro 정밀도는 {precision:.4f}입니다. "
-        "이는 각 Class에 대해 해당 Class라고 예측한 결과가 "
-        "얼마나 정확했는지를 동일한 비중으로 평균한 값입니다."
-    )
-
-    st.write(
-        f"Macro 재현율은 {recall:.4f}입니다. "
-        "이는 실제 각 Class의 데이터를 얼마나 놓치지 않고 "
-        "찾아냈는지를 동일한 비중으로 평균한 값입니다."
-    )
-
-    if precision > recall:
-        st.info(
-            "정밀도가 재현율보다 높습니다. "
-            "예측한 Class의 정확성은 상대적으로 높지만, "
-            "실제 Class 중 일부를 놓치는 경우가 있을 수 있습니다."
-        )
-    elif recall > precision:
-        st.info(
-            "재현율이 정밀도보다 높습니다. "
-            "실제 Class를 찾아내는 비율은 상대적으로 높지만, "
-            "다른 Class를 해당 Class로 잘못 예측하는 경우가 있을 수 있습니다."
-        )
-    else:
-        st.info("Macro 정밀도와 재현율이 같습니다.")
-
-    # 3. F1 해석
-    st.markdown("#### ③ F1-score")
-
-    st.write(
-        f"Macro F1-score는 {f1:.4f}, "
-        f"Weighted F1-score는 {weighted_f1:.4f}입니다."
-    )
-
-    st.write(
-        "F1-score는 정밀도와 재현율의 조화평균으로, "
-        "두 지표를 함께 고려하여 분류 성능을 평가합니다."
-    )
-
-    if f1 >= 0.8:
-        st.write("이번 모델은 테스트 데이터에서 비교적 높은 Macro F1-score를 보였습니다.")
-    elif f1 >= 0.6:
-        st.write("이번 모델은 일정 수준의 분류 성능을 보였지만 개선할 여지가 있습니다.")
-    else:
-        st.write("이번 모델의 Macro F1-score가 낮은 편이므로 분류 성능 개선이 필요합니다.")
-
-    if abs(f1 - weighted_f1) >= 0.1:
-        st.warning(
-            "Macro F1-score와 Weighted F1-score 사이에 차이가 있습니다. "
-            "클래스별 데이터 수 차이가 전체 평가 결과에 영향을 주었을 가능성이 있습니다."
-        )
-
-    # 4. 혼동 행렬 해석
-    st.markdown("#### ④ 혼동 행렬 분석")
-
-    recalls = per_class_df.set_index("Class")["재현율"]
-
-    easiest = recalls.idxmax()
-    hardest = recalls.idxmin()
-
-    st.write(
-        f"가장 높은 재현율을 기록한 Class는 '{easiest}'이며 "
-        f"재현율은 {recalls.max():.4f}입니다."
-    )
-
-    st.write(
-        f"가장 낮은 재현율을 기록한 Class는 '{hardest}'이며 "
-        f"재현율은 {recalls.min():.4f}입니다."
-    )
-
-    st.write(
-        "따라서 이번 모델에서는 "
-        f"'{easiest}'를 상대적으로 잘 분류했으며, "
-        f"'{hardest}'의 실제 데이터를 찾아내는 데 어려움이 있었습니다."
-    )
-
-    # 5. 두 모델 비교
-    st.markdown("#### ⑤ 두 모델 비교 및 평가")
-
-    tree_f1 = result["의사결정나무"]["f1_macro"]
-    forest_f1 = result["랜덤 포레스트"]["f1_macro"]
-
-    tree_acc = result["의사결정나무"]["accuracy"]
-    forest_acc = result["랜덤 포레스트"]["accuracy"]
-
-    tree_report = result["의사결정나무"]["report"]
-    forest_report = result["랜덤 포레스트"]["report"]
-
-    tree_class_recalls = [
-        tree_report[str(c)]["recall"]
-        for c in classes
-    ]
-
-    forest_class_recalls = [
-        forest_report[str(c)]["recall"]
-        for c in classes
-    ]
-
-    tree_min_recall = min(tree_class_recalls)
-    forest_min_recall = min(forest_class_recalls)
-
-    st.write(
-        f"- 의사결정나무 Macro F1: {tree_f1:.4f}, "
-        f"정확도: {tree_acc:.4f}"
-    )
-
-    st.write(
-        f"- 랜덤 포레스트 Macro F1: {forest_f1:.4f}, "
-        f"정확도: {forest_acc:.4f}"
-    )
-
-    if forest_f1 > tree_f1:
-        st.write(
-            "랜덤 포레스트가 Macro F1-score에서 더 높은 성능을 보였습니다."
-        )
-    elif tree_f1 > forest_f1:
-        st.write(
-            "의사결정나무가 Macro F1-score에서 더 높은 성능을 보였습니다."
-        )
-    else:
-        st.write(
-            "두 모델의 Macro F1-score가 같습니다."
-        )
-
-    if forest_min_recall > tree_min_recall:
-        st.write(
-            "랜덤 포레스트는 가장 낮은 클래스별 재현율 측면에서도 "
-            "상대적으로 좋은 결과를 보였습니다."
-        )
-    elif tree_min_recall > forest_min_recall:
-        st.write(
-            "의사결정나무는 가장 낮은 클래스별 재현율 측면에서 "
-            "상대적으로 좋은 결과를 보였습니다."
-        )
-    else:
-        st.write("두 모델의 최저 클래스별 재현율은 같습니다.")
-
-    st.divider()
-
-    # =====================================================
-    # 13. 프로젝트 최종 결론 자동 작성
-    # =====================================================
-
-    st.subheader("7. 모델 평가를 통해 도출된 결론")
-
-    st.markdown("#### ① 어떤 모델이 더 우수했는가?")
-
-    st.write(
-        f"두 모델 중 Macro F1-score를 기준으로 선택한 모델은 "
-        f"'{best_name}'입니다. "
-        f"해당 모델의 Macro F1-score는 "
-        f"{result[best_name]['f1_macro']:.4f}입니다."
-    )
-
-    st.markdown("#### ② 오류 유형을 어느 정도 구분할 수 있었는가?")
-
-    st.write(
-        f"선택 모델의 정확도는 {acc:.4f}, "
-        f"Macro F1-score는 {f1:.4f}입니다. "
-        "이 결과를 통해 테스트 데이터에서 로봇의 작동 상태를 "
-        "어느 정도 분류할 수 있는지 확인했습니다."
-    )
-
-    st.markdown("#### ③ 상대적으로 분류하기 어려운 오류 유형")
-
-    st.write(
-        f"'{hardest}'의 재현율이 {recalls.min():.4f}로 "
-        "가장 낮았습니다. 따라서 이 Class를 다른 Class와 "
-        "구분하는 데 어려움이 있었던 것으로 해석할 수 있습니다."
-    )
-
-    st.markdown("#### ④ 데이터 수와 클래스 불균형의 영향")
-
-    largest_class = class_counts_clean.idxmax()
-    smallest_class = class_counts_clean.idxmin()
-
-    st.write(
-        f"데이터가 가장 많은 Class는 '{largest_class}' "
-        f"({int(class_counts_clean.max())}개), "
-        f"가장 적은 Class는 '{smallest_class}' "
-        f"({int(class_counts_clean.min())}개)입니다."
-    )
-
-    st.write("""
-    특정 Class의 데이터가 적으면 모델이 해당 유형의 다양한
-    센서 패턴을 충분히 학습하지 못할 가능성이 있습니다.
-    또한 전체 데이터 자체가 많지 않으므로 테스트 데이터의
-    구성에 따라 평가 점수가 달라질 수 있습니다.
-    """)
-
-    st.markdown("#### ⑤ 프로젝트의 한계와 개선점")
-
-    st.write("""
-    - LP1 데이터는 총 88개로 데이터의 양이 제한적입니다.
-    - 특정 Class의 데이터가 다른 Class보다 적을 수 있습니다.
-    - 학습 데이터와 테스트 데이터의 분할 방식에 따라 성능이 달라질 수 있습니다.
-    - 90개 센서값을 그대로 사용하는 방식이 모든 시간적 특징을 충분히 설명하지 못할 수 있습니다.
-    - 실제 산업용 로봇에 적용하기 위해서는 다양한 작업 환경과 센서 조건에서 추가 검증이 필요합니다.
-
-    향후에는 더 많은 데이터를 수집하고, 시간에 따른 힘과 토크의 변화량,
-    평균, 최댓값 등의 특징을 추가하여 모델의 성능을 개선할 수 있습니다.
-    """)
-
-    st.info(
-        "이번 결과는 제한된 LP1 데이터에 대한 실험 결과이며, "
-        "실제 산업 현장에서의 오류 진단 성능을 보장하지 않습니다."
-    )
-
-
-# =========================================================
-# 14. 새로운 센서 데이터로 Class 예측
-# =========================================================
-
-elif menu == "⑥ 로봇 오류 유형 예측":
-
-    st.header("⑥ 로봇 오류 유형 예측")
-
-    if "final_model" not in st.session_state:
-        st.warning(
-            "먼저 '④ 데이터 전처리 및 모델 학습'에서 "
-            "두 모델을 학습해 주세요."
-        )
-        st.stop()
-
-    final_model = st.session_state["final_model"]
-    best_name = st.session_state["best_name"]
-    clean_df = st.session_state["clean_df"]
-
-    st.success(f"현재 사용 중인 예측 모델: {best_name}")
-
-    st.write("""
-    새로운 로봇 센서 측정값 90개를 입력하면
-    학습된 모델이 해당 데이터의 Class를 분류합니다.
-
-    입력값은 15개 측정 시점의 Fx, Fy, Fz, Tx, Ty, Tz 값으로 구성됩니다.
-    """)
-
-    # 기본 입력값은 실제 학습 데이터의 각 컬럼 중앙값으로 설정
-    default_values = clean_df[FEATURES].median()
-
-    st.info(
-        "입력 편의를 위해 각 입력란에는 실제 학습 데이터의 중앙값을 "
-        "기본값으로 표시합니다. 실제 센서 측정값이 있다면 해당 값으로 수정하세요."
-    )
-
-    with st.form("prediction_form"):
-
-        st.subheader("힘 센서 입력값")
-
-        force_input = {}
-
-        for channel in FORCE_CHANNELS:
-
-            with st.expander(f"{channel} : {'X' if channel == 'Fx' else 'Y' if channel == 'Fy' else 'Z'}축 힘", expanded=False):
-
-                cols = st.columns(5)
-
-                for i in range(1, 16):
-
-                    name = f"{channel}{i}"
-
-                    with cols[(i - 1) % 5]:
-
-                        force_input[name] = st.number_input(
-                            name,
-                            value=float(default_values[name]),
-                            key=f"force_{name}"
-                        )
-
-        st.divider()
-
-        st.subheader("토크 센서 입력값")
-
-        torque_input = {}
-
-        for channel in TORQUE_CHANNELS:
-
-            with st.expander(f"{channel} : {'X' if channel == 'Tx' else 'Y' if channel == 'Ty' else 'Z'}축 토크", expanded=False):
-
-                cols = st.columns(5)
-
-                for i in range(1, 16):
-
-                    name = f"{channel}{i}"
-
-                    with cols[(i - 1) % 5]:
-
-                        torque_input[name] = st.number_input(
-                            name,
-                            value=float(default_values[name]),
-                            key=f"torque_{name}"
-                        )
-
-        st.divider()
-
-        predict_button = st.form_submit_button(
-            "🔍 로봇 오류 유형 분류하기",
-            type="primary",
-            use_container_width=True
-        )
-
-    if predict_button:
-
-        # 입력값 90개를 원래 모델의 컬럼 순서로 정리
-        input_values = {
-            **force_input,
-            **torque_input
-        }
-
-        input_df = pd.DataFrame(
-            [[input_values[col] for col in FEATURES]],
-            columns=FEATURES
-        )
-
-        # 예측 실행
-        prediction = final_model.predict(input_df)[0]
-
-        st.divider()
-
-        st.subheader("예측 결과")
-
-        st.markdown(
-            f"""
-            <div style="
-                background-color: #e8f1ff;
-                padding: 25px;
-                border-radius: 12px;
-                text-align: center;
-                border: 1px solid #b5d0f5;
-            ">
-                <p style="font-size:18px; color:#315b91;">
-                    머신러닝 분류 결과
-                </p>
-                <h1 style="color:#174a8b; font-size:42px;">
-                    {prediction}
-                </h1>
-                <p style="font-size:16px; color:#315b91;">
-                    예측된 Class
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-        st.write("### 클래스별 예측 확률")
-
-        if hasattr(final_model, "predict_proba"):
-
-            probabilities = final_model.predict_proba(input_df)[0]
-
-            model_classes = final_model.named_steps["model"].classes_
-
-            probability_df = pd.DataFrame({
-                "Class": model_classes.astype(str),
-                "예측 확률": probabilities
-            })
-
-            probability_df = probability_df.sort_values(
-                "예측 확률",
-                ascending=False
-            )
-
-            fig_probability = px.bar(
-                probability_df,
-                x="Class",
-                y="예측 확률",
-                color="Class",
-                text=probability_df["예측 확률"].map(
-                    lambda x: f"{x:.1%}"
-                ),
-                title="Class별 예측 확률",
-                range_y=[0, 1]
-            )
-
-            st.plotly_chart(
-                fig_probability,
-                use_container_width=True
-            )
-
-            st.caption(
-                "예측 확률은 모델이 학습한 데이터의 패턴을 바탕으로 "
-                "계산한 값이며, 실제 오류가 발생할 확률이나 "
-                "현장 고장 위험도를 직접 의미하지는 않습니다."
-            )
-
-        st.divider()
-
-        st.subheader("입력 데이터 확인")
-
-        st.dataframe(
-            input_df,
-            use_container_width=True
-        )
-
-        st.success(
-            "새로운 센서 측정값의 Class 분류가 완료되었습니다."
-        )
-
-        st.warning(
-            "이 결과는 학습에 사용된 데이터와 유사한 패턴을 "
-            "가진 입력에 대한 실습용 분류 결과입니다. "
-            "실제 산업용 로봇의 안전 판단이나 제어에 직접 사용해서는 안 됩니다."
-        )
-
-
-# =========================================================
-# 15. 하단 안내
-# =========================================================
 
 st.divider()
 
-st.caption("""
-산업용 로봇 오류 유형 예측 실습실
-데이터 출처: UCI Machine Learning Repository - Robot Execution Failures
-프로젝트 분야: 기계공학 / 로봇·자동화 / 데이터 과학
-""")
+# ---------------------------------------------------------
+# 3. 데이터 선택 및 업로드
+# ---------------------------------------------------------
+st.header("① 프로젝트 소개")
+intro1, intro2, intro3 = st.columns(3)
+intro1.metric("독립 변수", "90개", "힘·토크 측정값")
+intro2.metric("측정 시점", "15개", "각 시점마다 6개 측정")
+intro3.metric("종속 변수", "Class", "오류 유형 레이블")
+
+st.markdown(
+    """
+    **분류 원리**
+
+    로봇이 작업을 수행하는 동안 센서에는 각 방향의 힘(Force)과 토크(Torque)가
+    기록됩니다. 오류 상황에 따라 센서값의 크기와 변화 양상이 달라질 수 있습니다.
+    머신러닝 모델은 이러한 측정 패턴과 정답 Class 사이의 관계를 학습한 뒤,
+    새로운 측정값이 주어졌을 때 가장 알맞은 Class를 예측합니다.
+
+    - 힘: `Fx`, `Fy`, `Fz` — X, Y, Z축 방향의 힘
+    - 토크: `Tx`, `Ty`, `Tz` — X, Y, Z축 기준 회전 효과
+    - 시간 번호 1~15: 오류 감지 직후부터 기록한 15개 측정 시점
+    """
+)
+
+st.markdown(
+    "[UCI 데이터셋 공식 페이지](https://archive.ics.uci.edu/dataset/138/robot+execution+failures) "
+    " · [LP1 원본 데이터 설명](https://archive.ics.uci.edu/ml/machine-learning-databases/robotfailure-mld/robotfailure.html)"
+)
+
+st.divider()
+st.header("② 데이터 확인")
+
+source_choice = st.radio(
+    "데이터 불러오기 방법",
+    ["UCI에서 LP1 원본 데이터 불러오기", "내 컴퓨터에서 데이터 파일 업로드"],
+    horizontal=True
+)
+
+uploaded_file = None
+raw_bytes = None
+
+if source_choice == "UCI에서 LP1 원본 데이터 불러오기":
+    if st.button("UCI LP1 데이터 불러오기", type="primary"):
+        try:
+            raw_bytes = download_uci_lp1()
+            st.session_state["robot_lp1_bytes"] = raw_bytes
+            st.success("UCI LP1 데이터를 불러왔습니다.")
+        except Exception as exc:
+            st.error(
+                "UCI 서버에서 데이터를 가져오지 못했습니다. "
+                "인터넷 연결을 확인하거나 원본 파일을 직접 업로드해 주세요."
+            )
+            st.caption(f"오류 내용: {exc}")
+
+    if "robot_lp1_bytes" in st.session_state:
+        raw_bytes = st.session_state["robot_lp1_bytes"]
+    else:
+        st.info("위 버튼을 눌러 UCI의 LP1 원본 데이터를 불러오세요.")
+
+else:
+    uploaded_file = st.file_uploader(
+        "LP1 데이터 파일 선택 (.data, .csv, .txt)",
+        type=["data", "csv", "txt"]
+    )
+    if uploaded_file is not None:
+        raw_bytes = uploaded_file.getvalue()
+
+if raw_bytes is None:
+    st.stop()
+
+try:
+    df, feature_cols = read_robot_data(raw_bytes)
+except Exception as exc:
+    st.error(f"데이터 형식 오류: {exc}")
+    st.info(
+        "LP1 파일은 각 행에 Class 1개와 숫자형 센서 측정값 90개가 있어야 합니다. "
+        "원본 파일을 다시 확인해 주세요."
+    )
+    st.stop()
+
+classes = sorted(df["Class"].dropna().unique().tolist(), key=str)
+class_counts = df["Class"].value_counts()
+
+# 데이터 요약 카드
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("전체 데이터 수", f"{len(df):,}개")
+m2.metric("전체 열 수", f"{df.shape[1]:,}개")
+m3.metric("분류 클래스 수", f"{df['Class'].nunique()}개")
+m4.metric("결측 센서값", f"{int(df[feature_cols].isna().sum().sum()):,}개")
+
+st.subheader("데이터 상위 5개 행")
+st.dataframe(df.head(), use_container_width=True)
+
+with st.expander("컬럼 이름과 자료형 확인"):
+    info_df = pd.DataFrame({
+        "컬럼 이름": df.columns,
+        "자료형": [str(df[c].dtype) for c in df.columns],
+        "결측치 수": [int(df[c].isna().sum()) for c in df.columns]
+    })
+    st.dataframe(info_df, use_container_width=True)
+
+c1, c2 = st.columns(2)
+with c1:
+    st.subheader("Class별 데이터 개수")
+    st.dataframe(
+        class_counts.rename_axis("Class").reset_index(name="데이터 수"),
+        use_container_width=True
+    )
+with c2:
+    st.subheader("데이터 품질 확인")
+    st.write(f"- 중복 행 수: **{int(df.duplicated().sum())}개**")
+    st.write(f"- Class 결측치: **{int(df['Class'].isna().sum())}개**")
+    st.write(f"- 센서값 결측치: **{int(df[feature_cols].isna().sum().sum())}개**")
+    all_missing = [c for c in feature_cols if df[c].isna().all()]
+    if all_missing:
+        st.error(f"모든 값이 결측인 센서 컬럼이 있습니다: {all_missing}")
+    else:
+        st.success("모든 센서 컬럼에 적어도 하나 이상의 숫자 측정값이 있습니다.")
+
+st.divider()
+
+# ---------------------------------------------------------
+# 4. 탐색 및 시각화
+# ---------------------------------------------------------
+st.header("③ 데이터 탐색 및 시각화")
+
+# 실제 컬럼명에서 센서 축을 찾는다. UCI 헤더 없는 원본은 위에서 표준 이름 생성.
+channel_columns = {}
+for channel in CHANNELS:
+    cols = [
+        c for c in feature_cols
+        if re.fullmatch(rf"{channel}\d+", str(c), flags=re.IGNORECASE)
+    ]
+    channel_columns[channel] = cols
+
+# 헤더가 비표준인 경우에는 원본의 정해진 순서를 사용해 축별로 묶는다.
+if any(len(channel_columns[ch]) != 15 for ch in CHANNELS):
+    channel_columns = {
+        channel: [feature_cols[i] for i in range(channel_index, 90, 6)]
+        for channel_index, channel in enumerate(CHANNELS)
+    }
+
+axis_names = {"Fx": "X축 힘", "Fy": "Y축 힘", "Fz": "Z축 힘",
+              "Tx": "X축 토크", "Ty": "Y축 토크", "Tz": "Z축 토크"}
+
+# 시각화용 데이터 구성: 행별 평균 절댓값은 클래스별 센서 크기 비교에 활용
+plot_rows = []
+for _, row in df.iterrows():
+    for channel in CHANNELS:
+        values = pd.to_numeric(row[channel_columns[channel]], errors="coerce")
+        for value in values:
+            if pd.notna(value):
+                plot_rows.append({
+                    "Class": str(row["Class"]),
+                    "축": axis_names[channel],
+                    "종류": "힘" if channel.startswith("F") else "토크",
+                    "측정값": float(value)
+                })
+plot_df = pd.DataFrame(plot_rows)
+
+# 그래프 1: Class별 데이터 개수
+fig1 = px.bar(
+    class_counts.rename_axis("Class").reset_index(name="데이터 수"),
+    x="Class", y="데이터 수", color="Class",
+    title="Class별 데이터 개수",
+    text="데이터 수"
+)
+fig1.update_layout(showlegend=False, xaxis_title="Class", yaxis_title="데이터 개수")
+st.plotly_chart(fig1, use_container_width=True)
+st.caption(
+    f"전체 {len(df)}개 중 가장 많은 Class는 "
+    f"{class_counts.idxmax()}({class_counts.max()}개)이며, "
+    f"가장 적은 Class는 {class_counts.idxmin()}({class_counts.min()}개)입니다. "
+    "클래스별 표본 수 차이는 모델 평가에 영향을 줄 수 있습니다."
+)
+
+# 그래프 2: 힘 분포
+force_df = plot_df[plot_df["종류"] == "힘"]
+fig2 = px.box(
+    force_df, x="축", y="측정값", color="축",
+    title="X·Y·Z축 힘 측정값 분포",
+    points="outliers"
+)
+fig2.update_layout(showlegend=False, xaxis_title="힘 측정 축", yaxis_title="힘 측정값")
+st.plotly_chart(fig2, use_container_width=True)
+st.caption(
+    "상자그림의 중앙선은 중앙값, 상자 범위는 가운데 50%의 데이터 분포를 나타냅니다. "
+    "축마다 측정값의 범위와 이상치가 어떻게 다른지 비교할 수 있습니다."
+)
+
+# 그래프 3: 토크 분포
+torque_df = plot_df[plot_df["종류"] == "토크"]
+fig3 = px.box(
+    torque_df, x="축", y="측정값", color="축",
+    title="X·Y·Z축 토크 측정값 분포",
+    points="outliers"
+)
+fig3.update_layout(showlegend=False, xaxis_title="토크 측정 축", yaxis_title="토크 측정값")
+st.plotly_chart(fig3, use_container_width=True)
+st.caption(
+    "토크의 축별 중앙값과 분포 폭을 비교할 수 있습니다. "
+    "일부 큰 값은 특정 시점의 회전 효과가 상대적으로 컸음을 보여줄 수 있습니다."
+)
+
+# 행별 축 평균 절댓값을 계산해 클래스 간 크기 비교
+def make_instance_summary(kind):
+    selected_channels = ["Fx", "Fy", "Fz"] if kind == "힘" else ["Tx", "Ty", "Tz"]
+    records = []
+    for row_index, row in df.iterrows():
+        for channel in selected_channels:
+            vals = pd.to_numeric(row[channel_columns[channel]], errors="coerce")
+            records.append({
+                "Class": str(row["Class"]),
+                "축": axis_names[channel],
+                "평균 절댓값": float(vals.abs().mean()) if vals.notna().any() else np.nan,
+                "데이터 번호": row_index
+            })
+    return pd.DataFrame(records)
+
+force_summary = make_instance_summary("힘")
+torque_summary = make_instance_summary("토크")
+
+fig4 = px.box(
+    force_summary, x="Class", y="평균 절댓값", color="축",
+    title="Class별 힘 측정값 비교 (각 행의 축별 평균 절댓값)"
+)
+fig4.update_layout(xaxis_title="Class", yaxis_title="평균 절댓값")
+st.plotly_chart(fig4, use_container_width=True)
+st.caption(
+    "각 데이터 행에서 15개 시점의 힘 절댓값 평균을 계산해 비교한 그래프입니다. "
+    "Class에 따라 힘의 크기 분포가 달라지는지 살펴볼 수 있습니다."
+)
+
+fig5 = px.box(
+    torque_summary, x="Class", y="평균 절댓값", color="축",
+    title="Class별 토크 측정값 비교 (각 행의 축별 평균 절댓값)"
+)
+fig5.update_layout(xaxis_title="Class", yaxis_title="평균 절댓값")
+st.plotly_chart(fig5, use_container_width=True)
+st.caption(
+    "각 데이터 행에서 15개 시점의 토크 절댓값 평균을 계산한 그래프입니다. "
+    "클래스 사이의 분포가 겹치는 정도를 통해 구분의 어려움을 탐색할 수 있습니다."
+)
+
+st.divider()
+
+# ---------------------------------------------------------
+# 5. 전처리 및 모델 학습
+# ---------------------------------------------------------
+st.header("④ 데이터 전처리 및 모델 학습")
+
+st.markdown(
+    """
+    - 중복 행은 모델 학습 전에 제거합니다.
+    - Class가 없는 행은 학습할 수 없으므로 제외합니다.
+    - 센서값의 결측치는 학습 데이터의 중앙값으로 대체합니다.
+    - 중앙값 대체 과정은 `Pipeline` 안에서 수행하므로 테스트 데이터의 정보가
+      전처리 학습에 섞이지 않습니다.
+    - 학습/테스트 데이터는 기본 8:2로 나누고, 각 Class 비율을 유지하도록
+      층화 분할(Stratified Split)을 적용합니다.
+    """
+)
+
+test_ratio = st.slider(
+    "테스트 데이터 비율",
+    min_value=0.1, max_value=0.4, value=0.2, step=0.05,
+    help="기본값 0.2는 학습 데이터 80%, 테스트 데이터 20%를 의미합니다."
+)
+
+# 학습용 데이터 준비
+model_df = df.drop_duplicates().copy()
+model_df = model_df.dropna(subset=["Class"])
+X = model_df[feature_cols].copy()
+y = model_df["Class"].astype(str).copy()
+
+# 전부 결측인 특성은 중앙값을 계산할 수 없으므로 안내 후 중단
+empty_features = [c for c in feature_cols if X[c].isna().all()]
+
+st.write(f"- 원본 행 수: **{len(df)}개**")
+st.write(f"- 중복 제거 후 행 수: **{len(model_df)}개**")
+st.write(f"- 제거된 중복 행 수: **{len(df) - len(model_df)}개**")
+st.write(f"- 모델 입력 변수 수: **{X.shape[1]}개**")
+st.write(f"- 결측 센서값은 학습 데이터 중앙값으로 대체합니다.")
+
+if empty_features:
+    st.error(
+        "모든 값이 결측인 센서 컬럼이 있어 모델을 학습할 수 없습니다: "
+        + ", ".join(map(str, empty_features))
+    )
+    st.stop()
+
+if y.nunique() < 2:
+    st.error("분류 모델을 학습하려면 최소 2개 이상의 Class가 필요합니다.")
+    st.stop()
+
+class_min_count = int(y.value_counts().min())
+n_samples = len(y)
+n_classes = y.nunique()
+n_test = int(np.ceil(n_samples * test_ratio))
+n_train = n_samples - n_test
+
+if class_min_count < 2:
+    st.error(
+        "가장 적은 Class의 데이터가 2개 미만이어서 층화 분할을 할 수 없습니다. "
+        "각 Class에 최소 2개 이상의 데이터가 필요합니다."
+    )
+    st.stop()
+
+if n_test < n_classes or n_train < n_classes:
+    st.error(
+        "현재 테스트 비율에서는 학습 또는 테스트 데이터에 모든 Class를 "
+        "포함할 수 없습니다. 테스트 비율을 조정하거나 데이터를 더 확보해 주세요."
+    )
+    st.stop()
+
+try:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=test_ratio,
+        random_state=42,
+        stratify=y
+    )
+except ValueError as exc:
+    st.error(f"층화 데이터 분할에 실패했습니다: {exc}")
+    st.stop()
+
+st.success(
+    f"층화 분할 완료: 학습 {len(X_train)}개 / 테스트 {len(X_test)}개"
+)
+
+# 두 모델 모두 동일한 전처리 파이프라인을 사용
+models = {
+    "의사결정나무": Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("classifier", DecisionTreeClassifier(
+            random_state=42,
+            class_weight="balanced"
+        ))
+    ]),
+    "랜덤 포레스트": Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("classifier", RandomForestClassifier(
+            n_estimators=300,
+            random_state=42,
+            class_weight="balanced",
+            n_jobs=-1
+        ))
+    ])
+}
+
+st.info(
+    "**랜덤 포레스트**는 여러 의사결정나무를 학습시킨 뒤 각 나무의 예측을 "
+    "종합하여 최종 클래스를 결정하는 앙상블 분류 모델입니다."
+)
+
+# ---------------------------------------------------------
+# 6. 성능 평가
+# ---------------------------------------------------------
+st.header("⑤ 모델 성능 평가")
+
+results = {}
+reports = {}
+predictions = {}
+cv_results = {}
+
+with st.spinner("두 분류 모델을 학습하고 테스트 데이터로 평가하고 있습니다..."):
+    for model_name, model in models.items():
+        model.fit(X_train, y_train)
+        pred = model.predict(X_test)
+
+        accuracy = accuracy_score(y_test, pred)
+        p_macro, r_macro, f_macro, _ = precision_recall_fscore_support(
+            y_test, pred, average="macro", zero_division=0
+        )
+        p_weight, r_weight, f_weight, _ = precision_recall_fscore_support(
+            y_test, pred, average="weighted", zero_division=0
+        )
+
+        results[model_name] = {
+            "정확도": accuracy,
+            "Macro 정밀도": p_macro,
+            "Macro 재현율": r_macro,
+            "Macro F1": f_macro,
+            "Weighted 정밀도": p_weight,
+            "Weighted 재현율": r_weight,
+            "Weighted F1": f_weight
+        }
+        predictions[model_name] = pred
+        reports[model_name] = classification_report(
+            y_test, pred, labels=classes,
+            output_dict=True, zero_division=0
+        )
+
+        # 교차 검증은 학습 데이터 안에서만 수행. 각 fold에서 Pipeline이 다시 학습됨.
+        train_min_class = int(y_train.value_counts().min())
+        if train_min_class >= 2:
+            folds = min(5, train_min_class)
+            cv = StratifiedKFold(
+                n_splits=folds, shuffle=True, random_state=42
+            )
+            try:
+                scores = cross_val_score(
+                    model, X_train, y_train,
+                    cv=cv, scoring="f1_macro", n_jobs=-1
+                )
+                cv_results[model_name] = {
+                    "가능": True,
+                    "folds": folds,
+                    "mean": float(np.mean(scores)),
+                    "std": float(np.std(scores))
+                }
+            except Exception as exc:
+                cv_results[model_name] = {
+                    "가능": False,
+                    "reason": str(exc)
+                }
+        else:
+            cv_results[model_name] = {
+                "가능": False,
+                "reason": "학습 데이터에서 가장 적은 Class의 표본이 2개 미만입니다."
+            }
+
+# 성능 비교 표
+comparison = pd.DataFrame(results).T
+st.subheader("두 모델의 전체 성능 비교")
+st.dataframe(
+    comparison.style.format("{:.3f}"),
+    use_container_width=True
+)
+
+metric_cols = st.columns(4)
+for col, metric in zip(
+    metric_cols,
+    ["정확도", "Macro 정밀도", "Macro 재현율", "Macro F1"]
+):
+    col.metric(
+        metric,
+        f"{comparison.loc['랜덤 포레스트', metric]:.3f}",
+        f"의사결정나무 {comparison.loc['의사결정나무', metric]:.3f}"
+    )
+
+# 클래스별 성능
+st.subheader("Class별 성능")
+selected_model_name = st.selectbox(
+    "클래스별 상세 성능을 확인할 모델",
+    list(models.keys())
+)
+selected_report = reports[selected_model_name]
+
+class_report_rows = []
+for class_name in classes:
+    row = selected_report.get(str(class_name), {})
+    class_report_rows.append({
+        "Class": str(class_name),
+        "정밀도": row.get("precision", 0),
+        "재현율": row.get("recall", 0),
+        "F1-score": row.get("f1-score", 0),
+        "표본 수": int(row.get("support", 0))
+    })
+
+st.dataframe(
+    pd.DataFrame(class_report_rows).style.format({
+        "정밀도": "{:.3f}", "재현율": "{:.3f}", "F1-score": "{:.3f}"
+    }),
+    use_container_width=True
+)
+
+# 혼동 행렬
+st.subheader("혼동 행렬")
+cm = confusion_matrix(
+    y_test, predictions[selected_model_name], labels=classes
+)
+fig_cm = px.imshow(
+    cm,
+    x=[str(c) for c in classes],
+    y=[str(c) for c in classes],
+    text_auto=True,
+    color_continuous_scale="Blues",
+    title=f"{selected_model_name} 혼동 행렬"
+)
+fig_cm.update_layout(
+    xaxis_title="모델 예측 Class",
+    yaxis_title="실제 Class"
+)
+st.plotly_chart(fig_cm, use_container_width=True)
+st.caption(
+    "혼동 행렬의 행은 실제 Class, 열은 모델이 예측한 Class입니다. "
+    "대각선 숫자가 클수록 해당 Class를 올바르게 분류한 데이터가 많습니다. "
+    "대각선 밖의 값은 다른 Class로 잘못 분류한 사례입니다."
+)
+
+# 교차 검증 결과
+st.subheader("Stratified K-Fold 교차 검증")
+for name, cv_result in cv_results.items():
+    if cv_result["가능"]:
+        st.write(
+            f"- **{name}**: {cv_result['folds']}개 fold의 Macro F1 평균 "
+            f"**{cv_result['mean']:.3f}**, 표준편차 **{cv_result['std']:.3f}**"
+        )
+    else:
+        st.warning(f"{name}: 교차 검증을 수행하지 못했습니다. {cv_result['reason']}")
+
+# ---------------------------------------------------------
+# 7. 실제 결과를 바탕으로 자동 해석
+# ---------------------------------------------------------
+st.subheader("성능 평가 결과 해석")
+
+for model_name in models:
+    result = results[model_name]
+    st.markdown(f"**{model_name}**")
+    st.write(
+        f"- 정확도: 테스트 데이터 {len(y_test)}개 중 "
+        f"{accuracy_score(y_test, predictions[model_name]) * len(y_test):.0f}개를 "
+        f"올바르게 분류했으며, 정확도는 **{result['정확도']:.3f} "
+        f"({result['정확도'] * 100:.1f}%)**입니다."
+    )
+    st.write(
+        f"- 정밀도: Macro 정밀도는 **{result['Macro 정밀도']:.3f}**입니다. "
+        "모델이 특정 Class라고 예측한 결과가 실제로 해당 Class인 정도를 "
+        "클래스별로 동일한 비중으로 평균한 값입니다."
+    )
+    st.write(
+        f"- 재현율: Macro 재현율은 **{result['Macro 재현율']:.3f}**입니다. "
+        "실제 각 Class 데이터를 모델이 얼마나 찾아냈는지 나타냅니다."
+    )
+    st.write(
+        f"- F1-score: Macro F1은 **{result['Macro F1']:.3f}**입니다. "
+        "정밀도와 재현율의 균형을 나타내며 각 Class를 동일한 비중으로 평가합니다."
+    )
+
+    report = reports[model_name]
+    per_class_f1 = {
+        str(c): report.get(str(c), {}).get("f1-score", 0)
+        for c in classes
+    }
+    hardest_class = min(per_class_f1, key=per_class_f1.get)
+    easiest_class = max(per_class_f1, key=per_class_f1.get)
+    st.write(
+        f"- Class별 F1-score를 비교하면 **{easiest_class}**의 값이 가장 높고 "
+        f"**{hardest_class}**의 값이 가장 낮습니다. 따라서 현재 테스트 데이터에서는 "
+        f"{hardest_class}를 상대적으로 구분하기 어려웠습니다."
+    )
+
+# 혼동이 가장 많은 Class 쌍 찾기
+best_name_for_analysis = max(
+    results,
+    key=lambda name: (results[name]["Macro F1"], results[name]["정확도"])
+)
+best_pred = predictions[best_name_for_analysis]
+best_cm = confusion_matrix(y_test, best_pred, labels=classes)
+off_diag = best_cm.copy()
+np.fill_diagonal(off_diag, 0)
+
+if off_diag.max() > 0:
+    i, j = np.unravel_index(np.argmax(off_diag), off_diag.shape)
+    confusion_text = (
+        f"가장 많이 혼동한 사례는 실제 Class **{classes[i]}**를 "
+        f"Class **{classes[j]}**로 예측한 경우로, **{off_diag[i, j]}개**입니다."
+    )
+else:
+    confusion_text = "테스트 데이터에서 서로 다른 Class 사이의 오분류가 관찰되지 않았습니다."
+
+st.markdown("**혼동 행렬 분석**")
+st.write(confusion_text)
+
+# Macro F1 우선, 동률이면 정확도 비교
+tree_score = results["의사결정나무"]["Macro F1"]
+forest_score = results["랜덤 포레스트"]["Macro F1"]
+
+if forest_score > tree_score:
+    better_model_name = "랜덤 포레스트"
+    other_model_name = "의사결정나무"
+elif tree_score > forest_score:
+    better_model_name = "의사결정나무"
+    other_model_name = "랜덤 포레스트"
+else:
+    if results["랜덤 포레스트"]["정확도"] >= results["의사결정나무"]["정확도"]:
+        better_model_name = "랜덤 포레스트"
+        other_model_name = "의사결정나무"
+    else:
+        better_model_name = "의사결정나무"
+        other_model_name = "랜덤 포레스트"
+
+st.subheader("모델 평가를 통해 도출된 결론")
+st.write(
+    f"1. **상대적으로 우수한 모델:** 테스트 데이터의 Macro F1-score를 우선 비교한 결과, "
+    f"현재 데이터 분할에서는 **{better_model_name}**이 더 높은 성능을 보였습니다. "
+    f"(Macro F1: {results[better_model_name]['Macro F1']:.3f}, "
+    f"{other_model_name}: {results[other_model_name]['Macro F1']:.3f})"
+)
+st.write(
+    f"2. **오류 유형 구분 능력:** {better_model_name}의 정확도는 "
+    f"{results[better_model_name]['정확도'] * 100:.1f}%이고 Macro F1-score는 "
+    f"{results[better_model_name]['Macro F1']:.3f}입니다. 이 결과는 이번에 분리한 "
+    "테스트 데이터에 대한 결과이며, 실제 산업 현장에서도 같은 성능을 보장하지 않습니다."
+)
+
+best_report = reports[better_model_name]
+best_class_f1 = {
+    str(c): best_report.get(str(c), {}).get("f1-score", 0)
+    for c in classes
+}
+hardest = min(best_class_f1, key=best_class_f1.get)
+st.write(
+    f"3. **분류가 어려운 유형:** 현재 테스트 데이터에서는 Class {hardest}의 "
+    f"F1-score가 가장 낮아 상대적으로 분류가 어려웠습니다. "
+    "클래스별 표본 수와 혼동 행렬을 함께 확인할 필요가 있습니다."
+)
+
+smallest_class = class_counts.idxmin()
+st.write(
+    f"4. **데이터 양과 불균형의 영향:** 원본 LP1은 총 {len(df)}개로 데이터 규모가 "
+    f"크지 않고, 가장 적은 Class는 {smallest_class}({class_counts.min()}개)입니다. "
+    "표본이 적은 클래스는 학습 과정에서 다양한 패턴을 충분히 반영하지 못할 수 있습니다."
+)
+st.write(
+    "5. **한계와 개선점:** 데이터가 88개로 비교적 적고 특정 작업 상황(LP1)에 한정되어 "
+    "있다는 점이 한계입니다. 다양한 로봇과 작업 환경의 데이터를 추가 수집하고, "
+    "시계열 특징을 요약하거나 다른 분류 모델과 비교하면 개선 가능성을 탐색할 수 있습니다."
+)
+
+# 최종 모델 저장: Macro F1 우선 선택
+final_model = models[better_model_name]
+st.session_state["robot_final_model"] = final_model
+st.session_state["robot_feature_cols"] = feature_cols
+st.session_state["robot_class_values"] = classes
+st.session_state["robot_final_model_name"] = better_model_name
+
+st.success(
+    f"새로운 센서값 분류에는 **{better_model_name}** 모델을 사용합니다. "
+    "선택 기준은 테스트 데이터의 Macro F1-score입니다."
+)
+
+st.divider()
+
+# ---------------------------------------------------------
+# 8. 새로운 센서 데이터 예측
+# ---------------------------------------------------------
+st.header("⑥ 로봇 오류 유형 분류")
+
+st.markdown(
+    """
+    아래에 새로운 로봇 센서 측정값 90개를 입력하면, 위에서 학습한 최종 모델이
+    Class를 예측합니다. 실제 센서 데이터의 측정 단위와 범위에 맞는 값을 입력해야 합니다.
+    기본값 0은 입력 예시일 뿐 실제 측정값을 의미하지 않습니다.
+    """
+)
+
+with st.form("prediction_form"):
+    st.subheader("힘(Force) 측정값")
+    input_values = {}
+
+    for channel in ["Fx", "Fy", "Fz"]:
+        with st.expander(f"{axis_names[channel]}: {channel}1 ~ {channel}15", expanded=False):
+            cols = st.columns(5)
+            for time_index in range(1, 16):
+                with cols[(time_index - 1) % 5]:
+                    input_values[f"{channel}{time_index}"] = st.number_input(
+                        f"{channel}{time_index}",
+                        value=0.0,
+                        step=0.1,
+                        key=f"input_{channel}_{time_index}"
+                    )
+
+    st.subheader("토크(Torque) 측정값")
+    for channel in ["Tx", "Ty", "Tz"]:
+        with st.expander(f"{axis_names[channel]}: {channel}1 ~ {channel}15", expanded=False):
+            cols = st.columns(5)
+            for time_index in range(1, 16):
+                with cols[(time_index - 1) % 5]:
+                    input_values[f"{channel}{time_index}"] = st.number_input(
+                        f"{channel}{time_index}",
+                        value=0.0,
+                        step=0.1,
+                        key=f"input_{channel}_{time_index}"
+                    )
+
+    submitted = st.form_submit_button("입력한 센서값으로 Class 분류하기", type="primary")
+
+if submitted:
+    # 데이터 컬럼 순서와 같은 순서로 입력값 구성
+    ordered_input = {}
+    for col in feature_cols:
+        match = re.fullmatch(r"(Fx|Fy|Fz|Tx|Ty|Tz)(\d+)", str(col), flags=re.IGNORECASE)
+        if match:
+            key = match.group(1) + match.group(2)
+            if key not in input_values:
+                st.error(f"입력 화면에서 {key} 측정값을 찾을 수 없습니다.")
+                st.stop()
+            ordered_input[col] = input_values[key]
+        else:
+            st.error(
+                f"컬럼 이름 '{col}'을 Fx1~Tz15 형식으로 해석할 수 없습니다. "
+                "예측 입력 기능은 표준 LP1 센서 컬럼 이름을 필요로 합니다."
+            )
+            st.stop()
+
+    input_df = pd.DataFrame([ordered_input], columns=feature_cols)
+    predicted_class = final_model.predict(input_df)[0]
+
+    st.success("분류가 완료되었습니다.")
+    st.markdown("### 예측 결과")
+    st.markdown(
+        f"<div style='padding:22px; border-radius:12px; "
+        f"background-color:#e8f1ff; text-align:center;'>"
+        f"<div style='font-size:18px; color:#334155;'>예측된 Class</div>"
+        f"<div style='font-size:48px; font-weight:700; color:#1d4ed8;'>"
+        f"{predicted_class}</div></div>",
+        unsafe_allow_html=True
+    )
+    st.info(
+        "이 데이터셋의 Class는 원본 레이블을 그대로 표시합니다. "
+        "확인되지 않은 숫자 레이블의 의미를 임의로 붙이지 않았습니다. "
+        "Class의 구체적인 의미는 데이터셋의 공식 설명 및 수업 자료에서 확인해 주세요."
+    )
+
+st.divider()
+st.caption(
+    "데이터 출처: Lopes, L. & Camarinha-Matos, L. (1998). "
+    "Robot Execution Failures. UCI Machine Learning Repository. "
+    "https://doi.org/10.24432/C5M89N"
+)
