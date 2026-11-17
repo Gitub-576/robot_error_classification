@@ -61,11 +61,17 @@ def is_number(value):
 
 
 
+
 def read_robot_data(file_bytes):
-    """LP1 원본 데이터를 읽어 Class 1개 + 센서값 90개 구조로 변환"""
+    """
+    UCI LP1 원본 데이터 파싱
+    데이터 1개 = Class 1개 + 센서값 90개
+    센서값은 6개씩 총 15줄로 구성
+    """
 
     decoded = None
 
+    # 파일 인코딩 확인
     for encoding in ["utf-8-sig", "cp949", "latin1"]:
         try:
             decoded = file_bytes.decode(encoding)
@@ -82,100 +88,144 @@ def read_robot_data(file_bytes):
 
     for line_number, line in enumerate(decoded.splitlines(), 1):
 
-        if not line.strip() or line.lstrip().startswith("#"):
+        line = line.strip()
+
+        # 빈 줄과 주석 제외
+        if not line or line.startswith("#"):
             continue
 
-        # 공백, 탭, 쉼표, 세미콜론 모두 구분자로 처리
-        values = re.split(r"[\s,;]+", line.strip())
-        values = [v for v in values if v]
+        # 공백, 탭, 쉼표, 세미콜론으로 분리
+        values = re.split(r"[\s,;]+", line)
+        values = [v.strip() for v in values if v.strip()]
 
-        # 한 줄에 Class + 센서값 90개가 있는 경우
+        # -------------------------------------------------
+        # 형식 1: 한 줄에 Class + 센서값 90개
+        # -------------------------------------------------
         if len(values) == 91:
+
             if current_class is not None:
                 raise ValueError(
-                    f"{line_number}번째 줄 이전 데이터가 완성되지 않았습니다."
+                    f"{line_number}번째 줄: 이전 데이터가 완성되지 않았습니다."
                 )
 
             if not all(is_number(v) for v in values[1:]):
                 raise ValueError(
-                    f"{line_number}번째 줄의 센서값에 숫자가 아닌 값이 있습니다."
+                    f"{line_number}번째 줄: 센서값에 숫자가 아닌 값이 있습니다."
                 )
 
             rows.append(
                 [values[0]] + [float(v) for v in values[1:]]
             )
+
             continue
 
-        # Class와 센서값 6개가 한 줄에 있는 경우
+        # -------------------------------------------------
+        # 형식 2: Class + 센서값 6개가 한 줄에 있는 경우
+        # -------------------------------------------------
         if len(values) == 7 and not is_number(values[0]):
+
             if current_class is not None:
                 raise ValueError(
-                    f"{line_number}번째 줄에서 이전 Class의 센서값이 "
+                    f"{line_number}번째 줄: 이전 Class의 센서값이 "
                     "90개보다 적습니다."
+                )
+
+            if not all(is_number(v) for v in values[1:]):
+                raise ValueError(
+                    f"{line_number}번째 줄: 센서값이 숫자가 아닙니다."
                 )
 
             current_class = values[0]
             current_values = [float(v) for v in values[1:]]
 
-        # Class만 있는 줄
+        # -------------------------------------------------
+        # 형식 3: Class만 있는 한 줄
+        # -------------------------------------------------
         elif len(values) == 1 and not is_number(values[0]):
+
             if current_class is not None:
                 raise ValueError(
-                    f"{line_number}번째 줄에서 이전 Class의 센서값이 "
+                    f"{line_number}번째 줄: 이전 Class의 센서값이 "
                     "90개보다 적습니다."
                 )
 
             current_class = values[0]
             current_values = []
 
-        # 센서 측정값 6개가 있는 줄
+        # -------------------------------------------------
+        # 형식 4: 센서 측정값 6개
+        # -------------------------------------------------
         elif len(values) == 6:
+
             if current_class is None:
                 raise ValueError(
-                    f"{line_number}번째 줄에 Class 정보가 없습니다."
+                    f"{line_number}번째 줄: Class 정보가 없습니다."
                 )
 
             if not all(is_number(v) for v in values):
                 raise ValueError(
-                    f"{line_number}번째 줄에 숫자가 아닌 값이 있습니다."
+                    f"{line_number}번째 줄: 숫자가 아닌 센서값이 있습니다."
                 )
 
-            current_values.extend([float(v) for v in values])
+            current_values.extend(
+                [float(v) for v in values]
+            )
 
         else:
             raise ValueError(
-                f"{line_number}번째 줄의 데이터 형식을 확인해 주세요. "
-                f"현재 분리된 값의 개수: {len(values)}개"
+                f"{line_number}번째 줄의 형식이 올바르지 않습니다. "
+                f"분리된 값의 개수: {len(values)}개"
             )
 
-        # 센서값 90개가 모이면 데이터 한 행 완성
+        # -------------------------------------------------
+        # 센서값 90개가 모이면 한 행 완성
+        # -------------------------------------------------
         if current_class is not None and len(current_values) == 90:
-            rows.append([current_class] + current_values)
+
+            rows.append(
+                [current_class] + current_values
+            )
+
             current_class = None
             current_values = []
 
-        elif current_class is not None and len(current_values) > 90:
+        elif len(current_values) > 90:
             raise ValueError(
-                f"{line_number}번째 줄에서 센서값이 90개를 초과했습니다."
+                f"{line_number}번째 줄: 센서값이 90개를 초과했습니다."
             )
 
+    # -------------------------------------------------
+    # 마지막 데이터 검증
+    # -------------------------------------------------
     if current_class is not None:
         raise ValueError(
-            f"마지막 Class {current_class}의 센서값이 90개보다 적습니다."
+            f"Class '{current_class}'의 센서값이 "
+            f"90개가 아닙니다. 현재 {len(current_values)}개입니다."
         )
 
     if not rows:
         raise ValueError("읽을 수 있는 데이터가 없습니다.")
 
+    # -------------------------------------------------
+    # 91개 컬럼 생성
+    # -------------------------------------------------
     columns = ["Class"] + [
         f"{channel}{i}"
         for i in range(1, 16)
         for channel in CHANNELS
     ]
 
-    parsed = pd.DataFrame(rows, columns=columns)
+    parsed = pd.DataFrame(
+        rows,
+        columns=columns
+    )
+
+    # 센서값 숫자형 확인
+    for col in columns[1:]:
+        parsed[col] = pd.to_numeric(parsed[col], errors="raise")
 
     return parsed, columns[1:]
+
 
 
 
