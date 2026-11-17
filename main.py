@@ -59,12 +59,16 @@ def is_number(value):
         return False
 
 
-
 def read_robot_data(file_bytes):
-    """UCI LP1 원본과 일반 CSV 파일을 읽는 함수"""
+    """
+    LP1 원본은 한 사례가 16줄로 저장된다.
+    첫 줄: Class 1개
+    다음 15줄: 각 시점의 센서값 6개(Fx, Fy, Fz, Tx, Ty, Tz)
+    따라서 한 사례는 총 1 + 15*6 = 91개의 값이다.
 
+    일반적인 CSV(한 행에 91개 값)도 함께 지원한다.
+    """
     decoded = None
-
     for encoding in ["utf-8-sig", "cp949", "latin1"]:
         try:
             decoded = file_bytes.decode(encoding)
@@ -73,21 +77,11 @@ def read_robot_data(file_bytes):
             continue
 
     if decoded is None:
-        raise ValueError("파일 인코딩을 확인할 수 없습니다.")
+        raise ValueError("파일의 문자 인코딩을 읽을 수 없습니다.")
 
-    lines = [
-        line.strip()
-        for line in decoded.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-
-    if not lines:
-        raise ValueError("데이터가 비어 있습니다.")
-
+    # 1) 우선 일반 CSV처럼 한 행에 91개 열이 있는 형식인지 확인한다.
     parsed = None
-
-    # 1. 일반 CSV 형식 확인
-    for separator in [",", ";", "\t"]:
+    for separator in [",", "\t", r"\s+", ";"]:
         try:
             candidate = pd.read_csv(
                 io.StringIO(decoded),
@@ -96,86 +90,100 @@ def read_robot_data(file_bytes):
                 engine="python",
                 comment="#"
             )
-
-            if candidate.shape[1] == 91:
+            if candidate.shape[1] == 91 and len(candidate) > 0:
                 parsed = candidate
                 break
-
         except Exception:
             pass
 
-    # 2. UCI 원본 형식 처리
-    # Class 1개 + 센서값 90개를 한 사례로 묶는다.
+    # 2) UCI 원본 형식: Class 한 줄 + 센서값 15줄.
+    #    줄 단위 구분에 의존하지 않고 모든 숫자/레이블 토큰을 순서대로 모은다.
     if parsed is None:
-
         tokens = []
+        for line in decoded.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # 공백, 탭, 쉼표, 세미콜론을 모두 구분자로 처리
+            tokens.extend([x for x in re.split(r"[\s,;]+", line) if x])
 
-        for line in lines:
-            cleaned = (
-                line.replace(",", " ")
-                    .replace(";", " ")
-                    .replace("\t", " ")
-            )
-            tokens.extend(cleaned.split())
+        if not tokens:
+            raise ValueError("파일에 읽을 수 있는 데이터가 없습니다.")
 
-        # 공백 구분 헤더가 있는 경우 제거
-        if tokens and tokens[0].lower() in {
-            "class", "target", "label", "분류", "정답"
-        }:
-            tokens = tokens[91:]
+        # 헤더가 포함된 파일은 첫 토큰이 Class/Label 등인지 확인
+        header_words = {"class", "target", "label", "분류", "정답"}
+        if tokens[0].strip().lower() in header_words:
+            tokens = tokens[1:]
+            # 헤더가 여러 줄로 된 91개 열 형식은 위 CSV 판별에서 처리되는 것이 일반적이다.
 
-        if len(tokens) == 0 or len(tokens) % 91 != 0:
+        if len(tokens) % 91 != 0:
             raise ValueError(
-                f"데이터 값의 개수({len(tokens)})가 "
-                "91개 단위로 나누어지지 않습니다. "
-                "올바른 LP1 파일인지 확인해 주세요."
+                "LP1 원본 데이터의 값 개수가 올바르지 않습니다. "
+                f"읽은 값은 {len(tokens)}개이며, 한 사례당 91개(Class 1개 + 센서값 90개)가 "
+                "필요합니다. 원본 lp1.data 파일 전체를 업로드했는지 확인해 주세요."
             )
 
-        rows = [
-            tokens[i:i + 91]
-            for i in range(0, len(tokens), 91)
-        ]
+        rows = []
+        for offset in range(0, len(tokens), 91):
+            sample = tokens[offset:offset + 91]
+            # 첫 값은 Class, 나머지 90개는 시간 순서대로 6개씩 15시점
+            rows.append(sample)
 
-        parsed = pd.DataFrame(
-            rows,
-            columns=["Class"] + CANONICAL_FEATURES
+        parsed = pd.DataFrame(rows, columns=make_default_columns())
+
+    # 일반 CSV에 헤더가 포함된 경우를 처리
+    first_row = parsed.iloc[0].astype(str).str.strip().tolist()
+    first_cell = first_row[0].lower()
+    header_words = {"class", "target", "label", "분류", "정답"}
+    has_header = (
+        first_cell in header_words
+        or any(
+            re.fullmatch(r"(fx|fy|fz|tx|ty|tz)\d+", x.lower())
+            for x in first_row[1:]
         )
+    )
+    if has_header:
+        columns = [str(x).strip() for x in first_row]
+        columns[0] = "Class"
+        parsed = parsed.iloc[1:].reset_index(drop=True)
+        parsed.columns = columns
+    elif list(parsed.columns) == list(range(91)):
+        parsed.columns = make_default_columns()
 
-    # 3. 컬럼 이름 확인
-    if parsed.columns[0] != "Class":
-        first_row = parsed.iloc[0].astype(str).tolist()
-
-        if first_row[0].strip().lower() in {
-            "class", "target", "label", "분류", "정답"
-        }:
-            parsed = parsed.iloc[1:].reset_index(drop=True)
-
-        parsed.columns = ["Class"] + CANONICAL_FEATURES
-
-    # 4. 데이터 형식 정리
-    feature_cols = [
-        c for c in parsed.columns if c != "Class"
+    # 첫 번째 열을 정답 레이블로 통일
+    class_candidates = [
+        c for c in parsed.columns
+        if str(c).strip().lower() in {"class", "target", "label", "분류", "정답"}
     ]
+    if class_candidates:
+        class_col = class_candidates[0]
+        if class_col != "Class":
+            parsed = parsed.rename(columns={class_col: "Class"})
+    else:
+        first_col = parsed.columns[0]
+        parsed = parsed.rename(columns={first_col: "Class"})
 
+    feature_cols = [c for c in parsed.columns if c != "Class"]
     if len(feature_cols) != 90:
         raise ValueError(
-            f"센서 측정값은 90개여야 하지만 "
-            f"{len(feature_cols)}개입니다."
+            f"센서 측정값은 90개여야 하지만 {len(feature_cols)}개입니다. "
+            "원본 LP1 데이터인지 확인해 주세요."
         )
 
     parsed["Class"] = parsed["Class"].astype(str).str.strip()
-
+    parsed.loc[parsed["Class"].isin(["", "nan", "None"]), "Class"] = np.nan
     for col in feature_cols:
-        parsed[col] = pd.to_numeric(
-            parsed[col], errors="coerce"
-        )
+        parsed[col] = pd.to_numeric(parsed[col], errors="coerce")
 
     parsed = parsed.dropna(subset=["Class"]).reset_index(drop=True)
-
     if parsed.empty:
-        raise ValueError("유효한 데이터가 없습니다.")
+        raise ValueError("유효한 Class 값이 있는 데이터 행을 찾지 못했습니다.")
 
+    # 열 이름이 비표준인 업로드 파일도 예측 입력과 일치하도록 표준화
+    parsed.columns = ["Class"] + CANONICAL_FEATURES
+    feature_cols = CANONICAL_FEATURES.copy()
     return parsed, feature_cols
+
 
 @st.cache_data(show_spinner=False)
 def download_uci_lp1():
